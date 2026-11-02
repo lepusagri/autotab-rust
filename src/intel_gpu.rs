@@ -12,13 +12,13 @@ use std::{
     ptr, slice,
 };
 
-struct Handle<T> {
-    ptr: *mut T,
+pub(crate) struct Handle<T> {
+    pub(crate) ptr: *mut T,
     free: unsafe fn(*mut T),
 }
 
 impl<T> Handle<T> {
-    fn new(free: unsafe fn(*mut T)) -> Self {
+    pub(crate) fn new(free: unsafe fn(*mut T)) -> Self {
         Self {
             ptr: ptr::null_mut(),
             free,
@@ -35,7 +35,7 @@ impl<T> Drop for Handle<T> {
     }
 }
 
-fn status(code: ov::ov_status_e) -> Result<()> {
+pub(crate) fn status(code: ov::ov_status_e) -> Result<()> {
     if code == ov::ov_status_e::OK {
         return Ok(());
     }
@@ -62,7 +62,11 @@ fn owned_string(value: *mut std::ffi::c_char) -> Result<String> {
     }
 }
 
-fn core_property(core: &Handle<ov::ov_core_t>, device: &CStr, key: &CStr) -> Result<String> {
+pub(crate) fn core_property(
+    core: &Handle<ov::ov_core_t>,
+    device: &CStr,
+    key: &CStr,
+) -> Result<String> {
     let mut value = ptr::null_mut();
     // SAFETY: core is live; all strings and the output slot live through the call.
     status(unsafe {
@@ -71,14 +75,17 @@ fn core_property(core: &Handle<ov::ov_core_t>, device: &CStr, key: &CStr) -> Res
     owned_string(value)
 }
 
-fn model_property(model: &Handle<ov::ov_compiled_model_t>, key: &CStr) -> Result<String> {
+pub(crate) fn model_property(
+    model: &Handle<ov::ov_compiled_model_t>,
+    key: &CStr,
+) -> Result<String> {
     let mut value = ptr::null_mut();
     // SAFETY: model is live and the output pointer is owned on success.
     status(unsafe { ov::ov_compiled_model_get_property(model.ptr, key.as_ptr(), &mut value) })?;
     owned_string(value)
 }
 
-fn set_property(
+pub(crate) fn set_property(
     core: &Handle<ov::ov_core_t>,
     device: &CStr,
     key: &CStr,

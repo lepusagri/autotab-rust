@@ -5,6 +5,9 @@ runs the six-stem Demucs ONNX model for guitar separation, Basic Pitch for note
 recognition, and the existing string/fret heuristic for ASCII tablature. It also
 writes a MIDI file.
 
+Note recognition can use **Basic Pitch**, **MuScriptor Small**, **MuScriptor Medium**
+or **MuScriptor Large**. All four run natively from Rust without a Python process.
+
 Intel Arc acceleration is enabled automatically when the bundled OpenVINO runtime
 is installed. Demucs runs directly on the Intel GPU through OpenVINO **2026.4.1**;
 the smaller Basic Pitch model stays on CPU. Everything runs locally without Python.
@@ -109,6 +112,69 @@ the playback test requires the Windows MIDI sequencer and uses a silent fixture)
 .\cargo-local.ps1 @('test', '--release', '--locked', '--features', 'gui', '--bin', 'autotab-gui', '--', '--ignored', '--test-threads=1')
 ```
 
+## MuScriptor models
+
+Choose **Notenerkennung** in the GUI, or select a model in the CLI:
+
+```powershell
+.\run-rust.cmd --input "C:\Music\song.mp3" --transcriber muscriptor-small
+.\run-rust.cmd --input "C:\Music\song.mp3" --transcriber muscriptor-medium
+.\run-rust.cmd --input "C:\Music\song.mp3" --transcriber muscriptor-large
+# Existing local checkpoint (select its matching size):
+.\run-rust.cmd --input "C:\Music\guitar.wav" --skip-separation --transcriber muscriptor-small --muscriptor-model "C:\Models\muscriptor-small\model.safetensors"
+```
+
+Basic Pitch remains the default (`--transcriber basic-pitch`). The selected model
+replaces note recognition; Demucs guitar separation, tuning, tabs and MIDI playback
+remain available. MuScriptor is conditioned on the acoustic / clean electric /
+distorted electric guitar groups. Its notes use fixed MIDI velocity, without
+estimated dynamics or pitch bends. Fret assignment still uses the tab heuristic.
+
+| Model | Weight download | Pinned Hugging Face revision |
+| --- | ---: | --- |
+| Small | 0.41 GB | `8c127f603b807520fa465c838e9bfee8a91ada4e` |
+| Medium | 1.23 GB | `f32236969308476e01fd3aae67357de5feb05a2d` |
+| Large | 5.47 GB | `8809fdfbed2affa7ade94a7059e746e3880720e7` |
+
+Model access is gated. Accept the conditions separately on the
+[Small](https://huggingface.co/MuScriptor/muscriptor-small),
+[Medium](https://huggingface.co/MuScriptor/muscriptor-medium) and
+[Large](https://huggingface.co/MuScriptor/muscriptor-large) model pages. Downloads
+use `HF_TOKEN`, or an existing Hugging Face token file (`HF_TOKEN_PATH` or
+`HF_HOME/token`). AutoTab never writes the token to its configuration or logs.
+The weights are **CC BY-NC 4.0**; the upstream inference code is MIT-licensed.
+No weights or credentials are included in this repository.
+
+AutoTab first checks its `models/` folder and the standard Hugging Face snapshot
+cache, respecting `HF_HOME`, `HF_HUB_CACHE` and `HUGGINGFACE_HUB_CACHE`. Missing
+weights download automatically on first use. Alternatively, select a local
+`.safetensors` file under **Weitere Einstellungen** in the GUI. The official F32
+checkpoints are supported, including the legacy single-codebook weight names.
+Quantized or fine-tuned checkpoints with different architectures are not supported.
+
+The Rust code builds OpenVINO IR directly from the checkpoint; no export script,
+Python, PyTorch or local model server is needed. Audio is resampled to 16 kHz and
+processed in five-second segments. The checkpoint's own Hann window and HTK mel
+filterbank are used. Autoregressive decoding keeps its KV state on the selected
+device; tie prompts preserve held notes across segments. `--device openvino`
+uses the selected Intel Arc GPU, while `--device cpu` uses the native OpenVINO CPU
+plugin. Both MuScriptor paths require the default `setup-rust.ps1` runtime; a
+previous `-CpuOnly` installation needs the normal setup once.
+
+The first run creates `.cache/muscriptor/`, including an additional full weight
+copy and compiled-device caches. Allow additional disk space and system / GPU RAM,
+especially for Large. First compilation is slower than later cached starts.
+
+The native Small smoke test covers two audio segments on Intel Arc without
+Python. Medium and Large share the parameterized implementation and are selectable,
+but their actual checkpoints have not been exercised here: Hugging Face returned
+HTTP 403 for the available credentials. Their downloads require model access or
+a local checkpoint.
+
+```powershell
+.\cargo-local.ps1 @('test', '--release', '--locked', '--bin', 'autotab', 'native_small_transcribes_without_python', '--', '--ignored', '--nocapture')
+```
+
 ## Intel Arc
 
 ```powershell
@@ -204,6 +270,7 @@ are excluded. Setup downloads the required runtime assets locally.
 - [Demucs](https://github.com/facebookresearch/demucs): MIT.
 - [Six-stem ONNX export and tensor specification](https://huggingface.co/StemSplitio/htdemucs-6s-onnx): MIT; pinned model revision `49df9b6989cf2150840ea65b0bef77a2e471b678`.
 - [basic-pitch-rs](https://github.com/AThevon/basic-pitch-rs): Apache-2.0, includes the official Spotify Basic Pitch model and Rust post-processing.
+- [MuScriptor](https://github.com/muscriptor/muscriptor): MIT code; the native implementation adapts its architecture, preprocessing and event decoder. The [MIT notice](docs/licenses/muscriptor-MIT.txt) is retained. Hugging Face model weights are separately gated and CC BY-NC 4.0.
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime): MIT.
 - [OpenVINO](https://github.com/openvinotoolkit/openvino) and [Rust bindings](https://github.com/intel/openvino-rs): Apache-2.0.
 - [FFmpeg Windows essentials build](https://www.gyan.dev/ffmpeg/builds/): see the build's bundled license; this distribution includes GPL components.

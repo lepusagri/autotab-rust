@@ -16,6 +16,12 @@ const DEVICES: [(&str, &str); 3] = [
     ("Intel Arc", "openvino"),
     ("CPU", "cpu"),
 ];
+const TRANSCRIBERS: [(&str, &str); 4] = [
+    ("Basic Pitch", "basic-pitch"),
+    ("MuScriptor Small · 0,41 GB", "muscriptor-small"),
+    ("MuScriptor Medium · 1,23 GB", "muscriptor-medium"),
+    ("MuScriptor Large · 5,47 GB", "muscriptor-large"),
+];
 
 pub struct AutoTab {
     backend: Option<Backend>,
@@ -29,6 +35,8 @@ pub struct AutoTab {
     gpu_id: u16,
     threads: u16,
     clean_guitar: bool,
+    transcriber: usize,
+    muscriptor_model: String,
     job: Option<Job>,
     status: String,
     error: Option<String>,
@@ -75,6 +83,8 @@ impl AutoTab {
             gpu_id: 0,
             threads: 4,
             clean_guitar: false,
+            transcriber: 0,
+            muscriptor_model: String::new(),
             job: None,
             status: "Bereit für deine Audiodatei".into(),
             error: None,
@@ -129,6 +139,12 @@ impl AutoTab {
             gpu_id: self.gpu_id,
             threads: self.threads,
             clean_guitar: self.clean_guitar,
+            transcriber: TRANSCRIBERS[self.transcriber].1,
+            muscriptor_model: if self.transcriber > 0 && !self.muscriptor_model.trim().is_empty() {
+                Some(PathBuf::from(self.muscriptor_model.trim()))
+            } else {
+                None
+            },
         };
         match Job::start(backend, options) {
             Ok(job) => {
@@ -250,6 +266,21 @@ impl AutoTab {
                 });
             });
             ui.checkbox(&mut self.clean_guitar, "Reine Gitarrenaufnahme – Gitarrentrennung überspringen");
+            ui.horizontal(|ui| {
+                ui.label("Notenerkennung");
+                egui::ComboBox::from_id_salt("transcriber").selected_text(TRANSCRIBERS[self.transcriber].0).width(250.0).show_ui(ui, |ui| {
+                    for (index, (label, _)) in TRANSCRIBERS.iter().enumerate() {
+                        if ui.selectable_value(&mut self.transcriber, index, *label).changed() { self.muscriptor_model.clear(); }
+                    }
+                });
+            });
+            if self.transcriber > 0 {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("MuScriptor: CC BY-NC 4.0 · Modellfreigabe und Hugging-Face-Anmeldung für den Download erforderlich.").small().color(MUTED));
+                    ui.hyperlink_to("Modellseite", format!("https://huggingface.co/MuScriptor/{}", TRANSCRIBERS[self.transcriber].1));
+                });
+                ui.label(RichText::new("Vorhandene Modelle werden aus dem lokalen Hugging-Face-Cache geladen.").small().color(MUTED));
+            }
             ui.separator();
             ui.strong("2  Ausgabeordner");
             ui.horizontal(|ui| {
@@ -263,6 +294,16 @@ impl AutoTab {
             });
             ui.label(RichText::new("Tabulatur (.txt) und MIDI (.mid). Vorhandene Ergebnisse bleiben erhalten.").small().color(MUTED));
             egui::CollapsingHeader::new("Weitere Einstellungen").show(ui, |ui| {
+                if self.transcriber > 0 {
+                    ui.label("Lokale MuScriptor-Modelldatei (optional)");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.muscriptor_model).desired_width((ui.available_width() - 135.0).max(200.0)).hint_text("Automatisch aus Cache / Download"));
+                        if ui.button("Modell wählen …").clicked()
+                            && let Some(path) = rfd::FileDialog::new().set_title("MuScriptor-Modell auswählen").add_filter("Safetensors", &["safetensors"]).pick_file() {
+                            self.muscriptor_model = path.to_string_lossy().into_owned();
+                        }
+                    });
+                }
                 ui.horizontal(|ui| {
                     ui.label("Intel-GPU-Index"); ui.add(egui::DragValue::new(&mut self.gpu_id).range(0..=15));
                     ui.add_space(20.0);
@@ -336,7 +377,7 @@ impl AutoTab {
                         );
                     });
             });
-        let height = ui.available_height().max(100.0);
+        let height = ui.available_height().clamp(160.0, 360.0);
         egui::Frame::group(ui.style())
             .fill(Color32::WHITE)
             .inner_margin(14.0)
@@ -465,72 +506,79 @@ impl eframe::App for AutoTab {
                     .inner_margin(22.0),
             )
             .show(context, |ui| {
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 9.0, BLUE);
-                    for row in 0..6 {
-                        let y = rect.top() + 11.0 + row as f32 * 4.0;
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(rect.left() + 8.0, y),
-                                egui::pos2(rect.right() - 8.0, y),
-                            ],
-                            egui::Stroke::new(1.0, Color32::WHITE),
-                        );
-                    }
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("AutoTab")
-                                .size(26.0)
-                                .strong()
-                                .color(Color32::from_rgb(23, 39, 62)),
-                        );
-                        ui.label(RichText::new("Audio in Gitarrentabs verwandeln").color(MUTED));
-                    });
-                });
-                ui.add_space(10.0);
-                if let Some(error) = &self.startup_error {
-                    ui.colored_label(Color32::from_rgb(174, 38, 45), error);
-                }
-                ui.add_enabled_ui(!running, |ui| self.form(ui));
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            !running && self.backend.is_some(),
-                            egui::Button::new(
-                                RichText::new("Tabs erstellen").color(Color32::WHITE),
-                            )
-                            .fill(BLUE)
-                            .min_size(egui::vec2(150.0, 36.0)),
-                        )
-                        .clicked()
-                    {
-                        self.start();
-                    }
-                    if running && ui.button("Abbrechen").clicked() {
-                        if let Some(job) = &self.job {
-                            job.cancel();
+                egui::ScrollArea::vertical()
+                    .id_salt("main_scroll")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(42.0, 42.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 9.0, BLUE);
+                            for row in 0..6 {
+                                let y = rect.top() + 11.0 + row as f32 * 4.0;
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(rect.left() + 8.0, y),
+                                        egui::pos2(rect.right() - 8.0, y),
+                                    ],
+                                    egui::Stroke::new(1.0, Color32::WHITE),
+                                );
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new("AutoTab")
+                                        .size(26.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(23, 39, 62)),
+                                );
+                                ui.label(
+                                    RichText::new("Audio in Gitarrentabs verwandeln").color(MUTED),
+                                );
+                            });
+                        });
+                        ui.add_space(10.0);
+                        if let Some(error) = &self.startup_error {
+                            ui.colored_label(Color32::from_rgb(174, 38, 45), error);
                         }
-                        self.status = "Verarbeitung wird abgebrochen …".into();
-                    }
-                    if running {
-                        ui.spinner();
-                    }
-                    ui.label(&self.status);
-                });
-                if let Some((current, total)) = self.progress {
-                    ui.add(
-                        egui::ProgressBar::new(current as f32 / total.max(1) as f32)
-                            .text(format!("Gitarrentrennung: {current} / {total} Abschnitte")),
-                    );
-                }
-                if let Some(error) = &self.error {
-                    ui.colored_label(Color32::from_rgb(174, 38, 45), error);
-                }
-                ui.add_space(2.0);
-                self.results(ui);
+                        ui.add_enabled_ui(!running, |ui| self.form(ui));
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !running && self.backend.is_some(),
+                                    egui::Button::new(
+                                        RichText::new("Tabs erstellen").color(Color32::WHITE),
+                                    )
+                                    .fill(BLUE)
+                                    .min_size(egui::vec2(150.0, 36.0)),
+                                )
+                                .clicked()
+                            {
+                                self.start();
+                            }
+                            if running && ui.button("Abbrechen").clicked() {
+                                if let Some(job) = &self.job {
+                                    job.cancel();
+                                }
+                                self.status = "Verarbeitung wird abgebrochen …".into();
+                            }
+                            if running {
+                                ui.spinner();
+                            }
+                            ui.label(&self.status);
+                        });
+                        if let Some((current, total)) = self.progress {
+                            ui.add(
+                                egui::ProgressBar::new(current as f32 / total.max(1) as f32).text(
+                                    format!("Gitarrentrennung: {current} / {total} Abschnitte"),
+                                ),
+                            );
+                        }
+                        if let Some(error) = &self.error {
+                            ui.colored_label(Color32::from_rgb(174, 38, 45), error);
+                        }
+                        ui.add_space(2.0);
+                        self.results(ui);
+                    });
             });
     }
 }

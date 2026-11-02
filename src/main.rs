@@ -4,6 +4,7 @@ mod audio;
 mod download;
 mod inference;
 mod intel_gpu;
+mod muscriptor;
 mod separation;
 mod tab;
 mod tools;
@@ -40,6 +41,12 @@ struct Args {
     /// Override the six-stem Demucs ONNX model
     #[arg(long)]
     model: Option<PathBuf>,
+    /// Note-recognition model (MuScriptor uses native OpenVINO, no Python)
+    #[arg(long, value_enum, default_value = "basic-pitch")]
+    transcriber: muscriptor::Transcriber,
+    /// Local MuScriptor model.safetensors or directory; otherwise uses HF cache/download
+    #[arg(long, requires = "transcriber")]
+    muscriptor_model: Option<PathBuf>,
     /// Maximum CPU threads used by Demucs
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
     threads: u16,
@@ -72,6 +79,10 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     let total = Instant::now();
+    ensure!(
+        args.muscriptor_model.is_none() || args.transcriber.variant().is_some(),
+        "--muscriptor-model requires a muscriptor-* --transcriber"
+    );
     if let Some(input) = &args.input {
         ensure!(input.is_file(), "Input file not found: {}", input.display());
     }
@@ -137,8 +148,8 @@ fn run(args: Args) -> Result<()> {
         openvino_library: home.join("runtime/openvino-2026.4.1/openvino_c.dll"),
     };
     println!(
-        "Inference: {device:?}, GPU index {}, precision {:?}; Basic Pitch CPU",
-        args.gpu_id, args.precision
+        "Inference: {device:?}, GPU index {}, precision {:?}; transcriber {:?}",
+        args.gpu_id, args.precision, args.transcriber
     );
     let environment = ort::init_from(&runtime)?
         .with_name("autotab")
@@ -158,27 +169,37 @@ fn run(args: Args) -> Result<()> {
         fs::copy(&guitar_path, &path)
             .with_context(|| format!("Cannot write {}", path.display()))?;
     }
-    let mono = audio::decode(&ffmpeg, &guitar_path, 22_050, 1)?;
-    println!("[3/4] Transcribing with Basic Pitch...");
+    println!("[3/4] Transcribing with {:?}...", args.transcriber);
     let transcription_started = Instant::now();
-    let backend = Arc::new(inference::PitchBackend::new(&environment, &config)?);
-    let transcriber = BasicPitch::with_backend(backend.clone()).with_trim_mode(TrimMode::V0_4_0);
-    let transcription = transcriber.transcribe(&mono)?;
-    backend.finish_profile(&config)?;
+    let notes = if let Some(variant) = args.transcriber.variant() {
+        let mono = audio::decode(&ffmpeg, &guitar_path, 16_000, 1)?;
+        muscriptor::transcribe(
+            variant,
+            &mono,
+            &home,
+            args.muscriptor_model.as_deref(),
+            &config,
+        )?
+    } else {
+        let mono = audio::decode(&ffmpeg, &guitar_path, 22_050, 1)?;
+        let backend = Arc::new(inference::PitchBackend::new(&environment, &config)?);
+        let transcriber =
+            BasicPitch::with_backend(backend.clone()).with_trim_mode(TrimMode::V0_4_0);
+        let transcription = transcriber.transcribe(&mono)?;
+        backend.finish_profile(&config)?;
+        transcription.notes
+    };
     let transcription_seconds = transcription_started.elapsed().as_secs_f64();
-    println!(
-        "[4/4] Writing MIDI and tab ({} notes)...",
-        transcription.notes.len()
-    );
-    let midi = transcription.to_midi(&Default::default())?;
+    println!("[4/4] Writing MIDI and tab ({} notes)...", notes.len());
+    let midi = basic_pitch::midi::note_events_to_midi_bytes(&notes, &Default::default())?;
     tools::create_parent(&output)?;
     tools::create_parent(&midi_output)?;
     fs::write(&midi_output, midi)
         .with_context(|| format!("Cannot write {}", midi_output.display()))?;
-    fs::write(&output, tab::render(&transcription.notes, args.tuning))
+    fs::write(&output, tab::render(&notes, args.tuning))
         .with_context(|| format!("Cannot write {}", output.display()))?;
     println!("Tab: {}\nMIDI: {}", output.display(), midi_output.display());
-    if transcription.notes.is_empty() {
+    if notes.is_empty() {
         println!("No notes detected. Try a cleaner guitar recording or --skip-separation.");
     }
     let elapsed = total.elapsed().as_secs_f64();
@@ -191,8 +212,43 @@ fn run(args: Args) -> Result<()> {
             "precision": format!("{:?}", args.precision),
             "audio_seconds": audio_seconds, "separation_seconds": separation_seconds,
             "transcription_seconds": transcription_seconds, "total_seconds": elapsed,
-            "notes": transcription.notes.len()});
+            "transcriber": format!("{:?}", args.transcriber), "notes": notes.len()});
         fs::write(path, serde_json::to_vec_pretty(&timing)?)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    #[test]
+    fn accepts_all_muscriptor_variants_and_local_checkpoint() {
+        for name in ["muscriptor-small", "muscriptor-medium", "muscriptor-large"] {
+            let args = Args::try_parse_from([
+                "autotab",
+                "--input",
+                "guitar.wav",
+                "--transcriber",
+                name,
+                "--muscriptor-model",
+                "C:\\Music\\Modell März.safetensors",
+            ])
+            .unwrap();
+            assert!(args.transcriber.variant().is_some());
+            assert_eq!(
+                args.muscriptor_model.unwrap(),
+                PathBuf::from("C:\\Music\\Modell März.safetensors")
+            );
+        }
+        assert!(
+            Args::try_parse_from([
+                "autotab",
+                "--input",
+                "guitar.wav",
+                "--transcriber",
+                "invalid"
+            ])
+            .is_err()
+        );
+    }
 }

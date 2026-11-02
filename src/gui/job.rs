@@ -59,10 +59,18 @@ pub struct Options {
     pub gpu_id: u16,
     pub threads: u16,
     pub clean_guitar: bool,
+    pub transcriber: &'static str,
+    pub muscriptor_model: Option<PathBuf>,
 }
 
 impl Options {
     pub fn validate(&self) -> Result<()> {
+        if let Some(path) = &self.muscriptor_model {
+            ensure!(
+                path.is_file(),
+                "Die lokale MuScriptor-Modelldatei wurde nicht gefunden."
+            );
+        }
         match &self.source {
             Source::File(path) => ensure!(
                 path.is_file(),
@@ -112,12 +120,17 @@ impl Options {
             ("--device", self.device.to_owned()),
             ("--gpu-id", self.gpu_id.to_string()),
             ("--threads", self.threads.to_string()),
+            ("--transcriber", self.transcriber.to_owned()),
         ] {
             args.push(flag.into());
             args.push(value.into());
         }
         args.push("--output".into());
         args.push(self.output.clone().into_os_string());
+        if let Some(path) = &self.muscriptor_model {
+            args.push("--muscriptor-model".into());
+            args.push(std::path::absolute(path)?.into_os_string());
+        }
         if self.clean_guitar {
             args.push("--skip-separation".into());
         }
@@ -344,6 +357,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("Gitarre März.mp3");
         std::fs::write(&input, "fixture").unwrap();
+        let model = directory
+            .path()
+            .join("Modell März mit Leerzeichen.safetensors");
+        std::fs::write(&model, "fixture").unwrap();
         let options = Options {
             source: Source::File(input.clone()),
             output: directory.path().join("output.txt"),
@@ -352,10 +369,22 @@ mod tests {
             gpu_id: 1,
             threads: 4,
             clean_guitar: true,
+            transcriber: "muscriptor-small",
+            muscriptor_model: Some(model.clone()),
         };
         let arguments = options.arguments().unwrap();
         assert_eq!(arguments[1], input.as_os_str());
         assert!(arguments.contains(&OsString::from("--skip-separation")));
+        assert!(arguments.windows(2).any(|pair| pair
+            == [
+                OsString::from("--transcriber"),
+                OsString::from("muscriptor-small")
+            ]));
+        assert!(arguments.windows(2).any(|pair| pair
+            == [
+                OsString::from("--muscriptor-model"),
+                model.clone().into_os_string()
+            ]));
     }
 
     fn fixture(directory: &Path) -> PathBuf {
@@ -413,6 +442,8 @@ mod tests {
             gpu_id: 0,
             threads: 4,
             clean_guitar: false,
+            transcriber: "basic-pitch",
+            muscriptor_model: None,
         };
         let job = Job::start(native_backend(), options).unwrap();
         let mut saw_gpu = false;
@@ -445,6 +476,8 @@ mod tests {
             gpu_id: 0,
             threads: 1,
             clean_guitar: false,
+            transcriber: "basic-pitch",
+            muscriptor_model: None,
         };
         let job = Job::start(native_backend(), options).unwrap();
         loop {

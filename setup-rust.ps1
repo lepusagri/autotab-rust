@@ -43,7 +43,7 @@ if (-not (Test-Path runtime/onnxruntime.dll)) {
 if (-not $CpuOnly) {
     $target = 'runtime/openvino-2026.4.1'
     $marker = "$target/package-version.txt"
-    $libraries = @('openvino.dll', 'openvino_c.dll', 'openvino_intel_gpu_plugin.dll', 'openvino_onnx_frontend.dll', 'openvino_ir_frontend.dll', 'tbb12.dll', 'tbbbind_2_5.dll', 'tbbmalloc.dll', 'tbbmalloc_proxy.dll')
+    $libraries = @('openvino.dll', 'openvino_c.dll', 'openvino_intel_gpu_plugin.dll', 'openvino_intel_cpu_plugin.dll', 'openvino_onnx_frontend.dll', 'openvino_ir_frontend.dll', 'tbb12.dll', 'tbbbind_2_5.dll', 'tbbmalloc.dll', 'tbbmalloc_proxy.dll')
     $missing = @($libraries | Where-Object { -not (Test-Path "$target/$_") })
     if ($missing.Count -gt 0 -or -not (Test-Path $marker) -or (Get-Content $marker -Raw).Trim() -ne '2026.4.1-22982') {
         $archive = '.tools/openvino-2026.4.1.zip'
