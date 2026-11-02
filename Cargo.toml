@@ -1,0 +1,45 @@
+[package]
+name = "autotab"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Local audio-to-guitar-tab transcription without Python"
+default-run = "autotab"
+
+[features]
+gui = ["dep:eframe", "dep:rfd", "dep:windows-sys"]
+
+[[bin]]
+name = "autotab"
+path = "src/main.rs"
+
+[[bin]]
+name = "autotab-gui"
+path = "src/bin/autotab-gui.rs"
+required-features = ["gui"]
+
+[dependencies]
+anyhow = "1.0"
+basic-pitch-rs = { version = "=0.1.0", default-features = false, features = ["ort", "bundled-model", "midi"] }
+clap = { version = "4.5", features = ["derive"] }
+hound = "3.5"
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "api-22", "load-dynamic"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rusty_ytdl = { version = "=0.7.4", default-features = false, features = ["blocking", "rustls-tls"] }
+tempfile = "3"
+serde_json = "1"
+openvino = { version = "=0.11.1", features = ["runtime-linking"] }
+openvino-sys = { version = "=0.11.1", features = ["runtime-linking"] }
+libloading = "=0.8.9"
+sha2 = "0.10"
+eframe = { version = "=0.33.3", optional = true, default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+rfd = { version = "=0.15.4", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "=0.56.0"
+windows-sys = { version = "=0.61.2", optional = true, features = ["Win32_Foundation", "Win32_Media_Multimedia"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

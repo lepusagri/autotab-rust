@@ -1,0 +1,37 @@
+# Local build tools, dependencies and generated files
+/.tools/
+/target/
+/models/
+/runtime/
+/.cache/
+/temp/
+/output/
+/separated/
+*.log
+
+# Audio and generated MIDI
+*.mid
+*.midi
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+
+# IDE and operating system files
+/.vscode/
+/.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
