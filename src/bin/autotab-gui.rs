@@ -2,6 +2,9 @@
 
 #[path = "../gui/app.rs"]
 mod app;
+#[path = "../instruments.rs"]
+#[allow(dead_code)] // The shared catalog also provides CLI inference helpers.
+mod instruments;
 #[path = "../gui/job.rs"]
 mod job;
 #[path = "../gui/playback.rs"]

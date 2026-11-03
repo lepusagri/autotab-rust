@@ -2,14 +2,16 @@
 mod assets;
 mod graph;
 mod mel;
+mod midi;
 mod runtime;
 mod tokens;
 mod weights;
 
 use crate::inference::Config;
+use crate::instruments::Instruments;
 use anyhow::{Result, ensure};
-use basic_pitch::NoteEvent;
 use clap::ValueEnum;
+pub use midi::Transcription;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -97,7 +99,8 @@ pub fn transcribe(
     home: &Path,
     override_path: Option<&Path>,
     config: &Config,
-) -> Result<Vec<NoteEvent>> {
+    instruments: &Instruments,
+) -> Result<Transcription> {
     ensure!(
         !audio.is_empty() && audio.iter().all(|s| s.is_finite()),
         "Empty or invalid MuScriptor audio"
@@ -120,9 +123,8 @@ pub fn transcribe(
     let chunks = audio.len().div_ceil(80_000);
     let duration = audio.len() as f64 / 16_000.0;
     let mut classes = Vec::with_capacity(dim * 4);
-    // ClassConditioner tokenization adds one, then its forward adds one again.
-    // Guitar groups 4,5,6 therefore select rows 6,7,8; the null dataset uses row 1.
-    for row in [6, 7, 8] {
+    println!("  MuScriptor expected instruments: {instruments}");
+    for row in instruments.embedding_rows() {
         classes.extend(weights.row(
             "condition_provider.conditioners.instrument_group.embed.weight",
             row,
@@ -179,7 +181,7 @@ pub fn transcribe(
             let token = logits
                 .iter()
                 .enumerate()
-                .filter(|&(token, _)| token < 1393 && tokens::allowed(token))
+                .filter(|&(token, _)| token < 1393 && tokens::allowed(token, instruments))
                 .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
                 .map(|(index, _)| index)
                 .unwrap();
@@ -214,7 +216,9 @@ pub fn transcribe(
             started.elapsed().as_secs_f64()
         );
     }
-    Ok(decoder.finish())
+    Ok(Transcription {
+        notes: decoder.finish(),
+    })
 }
 
 fn add_positions(features: &mut [f32], dim: usize, offset: usize) {
@@ -282,7 +286,16 @@ mod tests {
                     * 0.3
             })
             .collect();
-        let notes = transcribe(Variant::Small, &audio, &home, None, &config).unwrap();
+        let notes = transcribe(
+            Variant::Small,
+            &audio,
+            &home,
+            None,
+            &config,
+            &Instruments::default(),
+        )
+        .unwrap()
+        .guitar_notes();
         assert!(
             !notes.is_empty(),
             "Expected notes in the synthetic A2 fixture"

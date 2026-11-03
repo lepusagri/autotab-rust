@@ -1,3 +1,4 @@
+use crate::instruments::{GROUPS, Instruments};
 use crate::job::{self, Backend, Event, Job, Options, Outcome, Source};
 use crate::playback::{Player, State as PlaybackState};
 use eframe::egui::{self, Color32, RichText};
@@ -39,6 +40,8 @@ pub struct AutoTab {
     muscriptor_model: String,
     hf_token: String,
     show_hf_token: bool,
+    instrument_groups: Vec<bool>,
+    automatic_instruments: bool,
     job: Option<Job>,
     status: String,
     error: Option<String>,
@@ -89,6 +92,11 @@ impl AutoTab {
             muscriptor_model: String::new(),
             hf_token: String::new(),
             show_hf_token: false,
+            instrument_groups: GROUPS
+                .iter()
+                .map(|group| (4..=6).contains(&group.id))
+                .collect(),
+            automatic_instruments: false,
             job: None,
             status: "Bereit für deine Audiodatei".into(),
             error: None,
@@ -135,6 +143,13 @@ impl AutoTab {
             return;
         }
         let source = self.source();
+        let instruments = match self.selected_instruments() {
+            Ok(value) => value,
+            Err(message) => {
+                self.error = Some(message);
+                return;
+            }
+        };
         let options = Options {
             output: job::output_path(&self.folder_path(), &source),
             source,
@@ -144,6 +159,7 @@ impl AutoTab {
             threads: self.threads,
             clean_guitar: self.clean_guitar,
             transcriber: TRANSCRIBERS[self.transcriber].1,
+            instruments,
             hf_token: if self.transcriber > 0 {
                 job::HfToken::new(&self.hf_token)
             } else {
@@ -274,7 +290,11 @@ impl AutoTab {
                     for (index, (label, _)) in DEVICES.iter().enumerate() { ui.selectable_value(&mut self.device, index, *label); }
                 });
             });
-            ui.checkbox(&mut self.clean_guitar, "Reine Gitarrenaufnahme – Gitarrentrennung überspringen");
+            if self.transcriber > 0 && self.selected_instruments().is_ok_and(|selection| selection.has_other_instruments()) {
+                ui.label(RichText::new("Originalaufnahme: Die gewählte Instrumentbesetzung wird ohne Demucs-Gitarrentrennung erkannt.").small().color(MUTED));
+            } else {
+                ui.checkbox(&mut self.clean_guitar, "Reine Gitarrenaufnahme – Gitarrentrennung überspringen");
+            }
             ui.horizontal(|ui| {
                 ui.label("Notenerkennung");
                 egui::ComboBox::from_id_salt("transcriber").selected_text(TRANSCRIBERS[self.transcriber].0).width(250.0).show_ui(ui, |ui| {
@@ -284,6 +304,29 @@ impl AutoTab {
                 });
             });
             if self.transcriber > 0 {
+                ui.horizontal(|ui| {
+                    ui.label("Erwartete Instrumente");
+                    ui.checkbox(&mut self.automatic_instruments, "Automatisch erkennen");
+                });
+                ui.add_enabled_ui(!self.automatic_instruments, |ui| {
+                    let labels: Vec<_> = GROUPS.iter().zip(&self.instrument_groups).filter(|(_, selected)| **selected).map(|(group, _)| group.label).collect();
+                    let summary = if labels.is_empty() { "Bitte Instrumente auswählen".to_owned() }
+                        else if labels.len() <= 3 { labels.join(", ") } else { format!("{} Instrumente", labels.len()) };
+                    egui::ComboBox::from_id_salt("expected_instruments").selected_text(summary).width(390.0)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show_ui(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                                for (group, selected) in GROUPS.iter().zip(&mut self.instrument_groups) {
+                                    ui.checkbox(selected, group.label).on_hover_text(format!("{} · Gruppen-ID {}", group.name, group.id));
+                                }
+                            });
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Gitarren").clicked() { self.select_groups(&[4, 5, 6]); }
+                        if ui.small_button("Klavier, Gitarre, Bass").clicked() { self.select_groups(&[0, 4, 7]); }
+                    });
+                });
+                ui.label(RichText::new("MIDI: alle erkannten Instrumente als getrennte Spuren. Tabulatur: Gitarrennoten.").small().color(MUTED));
                 let token_label = ui.label("Hugging-Face-Token (optional)");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.hf_token)
@@ -336,6 +379,21 @@ impl AutoTab {
                 ui.small("GPU.0 ist normalerweise die integrierte Intel-GPU. Für eine zweite Intel-GPU: Index 1.");
             });
         });
+    }
+
+    fn selected_instruments(&self) -> Result<Instruments, String> {
+        if self.transcriber == 0 {
+            return Ok(Instruments::default());
+        }
+        if self.automatic_instruments {
+            return Ok(Instruments::automatic());
+        }
+        Instruments::from_ids(GROUPS.iter().zip(&self.instrument_groups).filter(|(_, selected)| **selected).map(|(group, _)| group.id))
+            .map_err(|_| "Bitte mindestens ein erwartetes Instrument auswählen oder die automatische Erkennung aktivieren.".to_owned())
+    }
+
+    fn select_groups(&mut self, ids: &[u8]) {
+        self.instrument_groups = GROUPS.iter().map(|group| ids.contains(&group.id)).collect();
     }
 
     fn results(&mut self, ui: &mut egui::Ui) {

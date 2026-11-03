@@ -100,6 +100,7 @@ pub struct Options {
     pub transcriber: &'static str,
     pub muscriptor_model: Option<PathBuf>,
     pub hf_token: HfToken,
+    pub instruments: crate::instruments::Instruments,
 }
 
 impl Options {
@@ -167,6 +168,10 @@ impl Options {
         }
         args.push("--output".into());
         args.push(self.output.clone().into_os_string());
+        if self.transcriber.starts_with("muscriptor-") {
+            args.push("--instruments".into());
+            args.push(self.instruments.to_string().into());
+        }
         if let Some(path) = &self.muscriptor_model {
             args.push("--muscriptor-model".into());
             args.push(std::path::absolute(path)?.into_os_string());
@@ -419,6 +424,9 @@ mod tests {
             transcriber: "muscriptor-small",
             muscriptor_model: Some(model.clone()),
             hf_token: HfToken::new("test-session-credential"),
+            instruments: "acoustic_piano,acoustic_guitar,acoustic_bass"
+                .parse()
+                .unwrap(),
         };
         let arguments = options.arguments().unwrap();
         assert!(!arguments.iter().any(|argument| {
@@ -429,6 +437,11 @@ mod tests {
         assert!(!format!("{options:?}").contains("test-session-credential"));
         assert_eq!(arguments[1], input.as_os_str());
         assert!(arguments.contains(&OsString::from("--skip-separation")));
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == [OsString::from("--instruments"), OsString::from("0,4,7")])
+        );
         assert!(arguments.windows(2).any(|pair| pair
             == [
                 OsString::from("--transcriber"),
@@ -537,6 +550,7 @@ mod tests {
             transcriber: "basic-pitch",
             muscriptor_model: None,
             hf_token: HfToken::default(),
+            instruments: crate::instruments::Instruments::default(),
         };
         let job = Job::start(native_backend(), options).unwrap();
         let mut saw_gpu = false;
@@ -572,6 +586,7 @@ mod tests {
             transcriber: "basic-pitch",
             muscriptor_model: None,
             hf_token: HfToken::default(),
+            instruments: crate::instruments::Instruments::default(),
         };
         let job = Job::start(native_backend(), options).unwrap();
         loop {

@@ -126,9 +126,44 @@ Choose **Notenerkennung** in the GUI, or select a model in the CLI:
 
 Basic Pitch remains the default (`--transcriber basic-pitch`). The selected model
 replaces note recognition; Demucs guitar separation, tuning, tabs and MIDI playback
-remain available. MuScriptor is conditioned on the acoustic / clean electric /
-distorted electric guitar groups. Its notes use fixed MIDI velocity, without
-estimated dynamics or pitch bends. Fret assignment still uses the tab heuristic.
+remain available. MuScriptor defaults to the acoustic / clean electric / distorted
+electric guitar groups. Its notes use fixed MIDI velocity, without estimated
+dynamics or pitch bends. Fret assignment still uses the tab heuristic.
+
+### Expected instruments and multi-instrument MIDI
+
+In the GUI, use **Erwartete Instrumente** to select multiple instrument groups, or
+enable **Automatisch erkennen** to let MuScriptor identify the instrumentation.
+The **Klavier, Gitarre, Bass** preset corresponds to the published example, group
+IDs `0 4 7`. The list contains all named groups from `MT3_FULL_PLUS_GROUP_NAMES`.
+
+```powershell
+.\run-rust.cmd --input "C:\Music\mix.wav" --transcriber muscriptor-small --instruments "acoustic_piano,acoustic_guitar,acoustic_bass"
+# Equivalent numeric group IDs (also accepted with --instrument-group):
+.\run-rust.cmd --input "C:\Music\mix.wav" --transcriber muscriptor-small --instrument-group "0 4 7"
+# Infer the instrument groups without a preset:
+.\run-rust.cmd --input "C:\Music\mix.wav" --transcriber muscriptor-small --instruments auto
+```
+
+Names or IDs may be separated by commas or spaces. Unknown groups and an empty
+manual selection are rejected. Group IDs are model classes, not General MIDI
+program numbers: `4` means acoustic guitar, whose representative GM program is 24.
+The selection supplies the learned conditioning and restricts program/drum tokens
+to the selected groups. Automatic mode uses null instrument conditioning and
+allows all valid instrument tokens.
+
+**MIDI retains all recognized instruments**, including drums, on separate named
+tracks with their General MIDI programs. **ASCII tabs contain only guitar notes**;
+piano or bass notes are not assigned to guitar strings. If a result contains only
+other instruments, the MIDI still contains those notes and the tab has no guitar
+notes. More than 15 melodic programs use additional MIDI-port metadata to avoid
+sharing conflicting program changes on the same channel; playback of these ports
+depends on the MIDI player/device.
+
+Automatic mode or any selected non-guitar group uses the **original mix**, without
+Demucs guitar separation, so the other instruments remain audible to the model.
+Guitar-only selection keeps the existing optional Demucs path. A conditioning
+choice guides recognition; it does not separate an instrument's audio waveform.
 
 | Model | Weight download | Pinned Hugging Face revision |
 | --- | ---: | --- |

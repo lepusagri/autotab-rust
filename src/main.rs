@@ -3,6 +3,7 @@
 mod audio;
 mod download;
 mod inference;
+mod instruments;
 mod intel_gpu;
 mod muscriptor;
 mod separation;
@@ -47,6 +48,9 @@ struct Args {
     /// Local MuScriptor model.safetensors or directory; otherwise uses HF cache/download
     #[arg(long, requires = "transcriber")]
     muscriptor_model: Option<PathBuf>,
+    /// Expected MuScriptor instruments: comma/space-separated names or group IDs, or 'auto'
+    #[arg(long, alias = "instrument-group", default_value = "4,5,6")]
+    instruments: instruments::Instruments,
     /// Maximum CPU threads used by Demucs
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
     threads: u16,
@@ -80,6 +84,18 @@ fn main() {
 fn run(args: Args) -> Result<()> {
     let total = Instant::now();
     ensure!(
+        args.transcriber.variant().is_some()
+            || args.instruments == instruments::Instruments::default(),
+        "--instruments requires a muscriptor-* --transcriber"
+    );
+    let skip_separation = args.skip_separation
+        || (args.transcriber.variant().is_some() && args.instruments.has_other_instruments());
+    if skip_separation && !args.skip_separation {
+        println!(
+            "  MuScriptor uses the original mix for automatic or non-guitar instrument selection."
+        );
+    }
+    ensure!(
         args.muscriptor_model.is_none() || args.transcriber.variant().is_some(),
         "--muscriptor-model requires a muscriptor-* --transcriber"
     );
@@ -102,7 +118,7 @@ fn run(args: Args) -> Result<()> {
     let model = args
         .model
         .unwrap_or_else(|| home.join("models/htdemucs_6s.onnx"));
-    if !args.skip_separation {
+    if !skip_separation {
         ensure!(
             model.is_file(),
             "Demucs model missing: {}. Run setup-rust.ps1.",
@@ -130,7 +146,7 @@ fn run(args: Args) -> Result<()> {
     );
     println!(
         "[2/4] Decoding audio{}...",
-        if args.skip_separation {
+        if skip_separation {
             ""
         } else {
             " and isolating guitar"
@@ -156,7 +172,7 @@ fn run(args: Args) -> Result<()> {
         .with_telemetry(false)
         .build()?;
     let separation_started = Instant::now();
-    let guitar = if args.skip_separation {
+    let guitar = if skip_separation {
         mix
     } else {
         separation::guitar(&environment, &model, &mix, &config)?
@@ -171,15 +187,17 @@ fn run(args: Args) -> Result<()> {
     }
     println!("[3/4] Transcribing with {:?}...", args.transcriber);
     let transcription_started = Instant::now();
-    let notes = if let Some(variant) = args.transcriber.variant() {
+    let (notes, multi_instrument) = if let Some(variant) = args.transcriber.variant() {
         let mono = audio::decode(&ffmpeg, &guitar_path, 16_000, 1)?;
-        muscriptor::transcribe(
+        let transcription = muscriptor::transcribe(
             variant,
             &mono,
             &home,
             args.muscriptor_model.as_deref(),
             &config,
-        )?
+            &args.instruments,
+        )?;
+        (transcription.guitar_notes(), Some(transcription))
     } else {
         let mono = audio::decode(&ffmpeg, &guitar_path, 22_050, 1)?;
         let backend = Arc::new(inference::PitchBackend::new(&environment, &config)?);
@@ -187,11 +205,21 @@ fn run(args: Args) -> Result<()> {
             BasicPitch::with_backend(backend.clone()).with_trim_mode(TrimMode::V0_4_0);
         let transcription = transcriber.transcribe(&mono)?;
         backend.finish_profile(&config)?;
-        transcription.notes
+        (transcription.notes, None)
     };
     let transcription_seconds = transcription_started.elapsed().as_secs_f64();
-    println!("[4/4] Writing MIDI and tab ({} notes)...", notes.len());
-    let midi = basic_pitch::midi::note_events_to_midi_bytes(&notes, &Default::default())?;
+    let midi_notes = multi_instrument
+        .as_ref()
+        .map_or(notes.len(), |transcription| transcription.notes.len());
+    println!(
+        "[4/4] Writing MIDI ({midi_notes} notes) and guitar tab ({} notes)...",
+        notes.len()
+    );
+    let midi = if let Some(transcription) = multi_instrument {
+        transcription.to_midi()?
+    } else {
+        basic_pitch::midi::note_events_to_midi_bytes(&notes, &Default::default())?
+    };
     tools::create_parent(&output)?;
     tools::create_parent(&midi_output)?;
     fs::write(&midi_output, midi)
@@ -199,7 +227,11 @@ fn run(args: Args) -> Result<()> {
     fs::write(&output, tab::render(&notes, args.tuning))
         .with_context(|| format!("Cannot write {}", output.display()))?;
     println!("Tab: {}\nMIDI: {}", output.display(), midi_output.display());
-    if notes.is_empty() {
+    if notes.is_empty() && midi_notes > 0 {
+        println!(
+            "No guitar notes detected. Other recognized instruments are retained in the MIDI."
+        );
+    } else if notes.is_empty() {
         println!("No notes detected. Try a cleaner guitar recording or --skip-separation.");
     }
     let elapsed = total.elapsed().as_secs_f64();
@@ -212,7 +244,7 @@ fn run(args: Args) -> Result<()> {
             "precision": format!("{:?}", args.precision),
             "audio_seconds": audio_seconds, "separation_seconds": separation_seconds,
             "transcription_seconds": transcription_seconds, "total_seconds": elapsed,
-            "transcriber": format!("{:?}", args.transcriber), "notes": notes.len()});
+            "transcriber": format!("{:?}", args.transcriber), "instruments": args.instruments.to_string(), "notes": notes.len(), "midi_notes": midi_notes});
         fs::write(path, serde_json::to_vec_pretty(&timing)?)?;
     }
     Ok(())
@@ -221,6 +253,49 @@ fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    #[test]
+    fn accepts_instrument_names_ids_and_automatic_mode() {
+        for (flag, value) in [
+            (
+                "--instruments",
+                "acoustic_piano,acoustic_guitar,acoustic_bass",
+            ),
+            ("--instrument-group", "0 4 7"),
+        ] {
+            let args = Args::try_parse_from([
+                "autotab",
+                "--input",
+                "mix.wav",
+                "--transcriber",
+                "muscriptor-small",
+                flag,
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.instruments.to_string(), "0,4,7");
+        }
+        let args = Args::try_parse_from([
+            "autotab",
+            "--input",
+            "mix.wav",
+            "--transcriber",
+            "muscriptor-small",
+            "--instruments",
+            "auto",
+        ])
+        .unwrap();
+        assert!(args.instruments.is_automatic());
+        assert!(
+            Args::try_parse_from([
+                "autotab",
+                "--input",
+                "mix.wav",
+                "--instruments",
+                "not_an_instrument"
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn accepts_all_muscriptor_variants_and_local_checkpoint() {
         for name in ["muscriptor-small", "muscriptor-medium", "muscriptor-large"] {
