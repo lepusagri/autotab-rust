@@ -50,6 +50,44 @@ pub enum Source {
     Url(String),
 }
 
+/// Session-only credential. Debug output deliberately never includes its value.
+#[derive(Clone, Default)]
+pub struct HfToken(String);
+
+impl std::fmt::Debug for HfToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("HfToken([redacted])")
+    }
+}
+
+impl HfToken {
+    pub fn new(value: &str) -> Self {
+        Self(value.trim().to_owned())
+    }
+
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.0.bytes().all(|byte| byte.is_ascii_graphic()),
+            "Der Hugging-Face-Token darf keine Leer- oder Steuerzeichen enthalten."
+        );
+        Ok(())
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if !self.0.is_empty() {
+            command.env("HF_TOKEN", &self.0);
+        }
+    }
+
+    fn redact(&self, text: &str) -> String {
+        if self.0.is_empty() {
+            text.to_owned()
+        } else {
+            text.replace(&self.0, "[Token ausgeblendet]")
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub source: Source,
@@ -61,10 +99,12 @@ pub struct Options {
     pub clean_guitar: bool,
     pub transcriber: &'static str,
     pub muscriptor_model: Option<PathBuf>,
+    pub hf_token: HfToken,
 }
 
 impl Options {
     pub fn validate(&self) -> Result<()> {
+        self.hf_token.validate()?;
         if let Some(path) = &self.muscriptor_model {
             ensure!(
                 path.is_file(),
@@ -227,12 +267,16 @@ pub fn hide_console(command: &mut Command) {
     }
 }
 
-fn read_lines(reader: impl Read + Send + 'static, sender: Sender<Event>) -> JoinHandle<()> {
+fn read_lines(
+    reader: impl Read + Send + 'static,
+    sender: Sender<Event>,
+    token: HfToken,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(reader).lines() {
             match line {
                 Ok(line) => {
-                    if sender.send(Event::Line(line)).is_err() {
+                    if sender.send(Event::Line(token.redact(&line))).is_err() {
                         break;
                     }
                 }
@@ -287,6 +331,7 @@ fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_console(&mut command);
+    options.hf_token.apply(&mut command);
     let mut child = command
         .spawn()
         .context("Die Verarbeitung konnte nicht gestartet werden")?;
@@ -296,6 +341,7 @@ fn run(
             .take()
             .context("Kein Ausgabeprotokoll verfügbar")?,
         sender.clone(),
+        options.hf_token.clone(),
     );
     let stderr = read_lines(
         child
@@ -303,6 +349,7 @@ fn run(
             .take()
             .context("Kein Fehlerprotokoll verfügbar")?,
         sender.clone(),
+        options.hf_token.clone(),
     );
     let outcome = loop {
         match child.try_wait() {
@@ -371,8 +418,15 @@ mod tests {
             clean_guitar: true,
             transcriber: "muscriptor-small",
             muscriptor_model: Some(model.clone()),
+            hf_token: HfToken::new("test-session-credential"),
         };
         let arguments = options.arguments().unwrap();
+        assert!(!arguments.iter().any(|argument| {
+            argument
+                .to_string_lossy()
+                .contains("test-session-credential")
+        }));
+        assert!(!format!("{options:?}").contains("test-session-credential"));
         assert_eq!(arguments[1], input.as_os_str());
         assert!(arguments.contains(&OsString::from("--skip-separation")));
         assert!(arguments.windows(2).any(|pair| pair
@@ -385,6 +439,44 @@ mod tests {
                 OsString::from("--muscriptor-model"),
                 model.clone().into_os_string()
             ]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn token_is_child_only_and_redacted_from_output() {
+        let original = std::env::var_os("HF_TOKEN");
+        let token = HfToken::new("  test-session-credential  ");
+        let mut command = Command::new("cmd.exe");
+        command.args(["/d", "/c", "echo %HF_TOKEN%"]);
+        hide_console(&mut command);
+        token.apply(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "test-session-credential"
+        );
+        assert_eq!(std::env::var_os("HF_TOKEN"), original);
+        let (sender, receiver) = mpsc::channel();
+        read_lines(std::io::Cursor::new(output.stdout), sender, token)
+            .join()
+            .unwrap();
+        let Event::Line(line) = receiver.recv().unwrap() else {
+            panic!("Expected output line")
+        };
+        assert_eq!(line, "[Token ausgeblendet]");
+    }
+
+    #[test]
+    fn blank_token_preserves_existing_auth_and_invalid_input_is_rejected() {
+        let mut command = Command::new("unused-test-program");
+        command.env("HF_TOKEN", "existing-authentication");
+        HfToken::new("   ").apply(&mut command);
+        assert!(command.get_envs().any(|(key, value)| key == "HF_TOKEN"
+            && value == Some(std::ffi::OsStr::new("existing-authentication"))));
+        let token = HfToken::new("test-session\ncredential");
+        let error = token.validate().unwrap_err().to_string();
+        assert!(!error.contains("test-session"));
     }
 
     fn fixture(directory: &Path) -> PathBuf {
@@ -444,6 +536,7 @@ mod tests {
             clean_guitar: false,
             transcriber: "basic-pitch",
             muscriptor_model: None,
+            hf_token: HfToken::default(),
         };
         let job = Job::start(native_backend(), options).unwrap();
         let mut saw_gpu = false;
@@ -478,6 +571,7 @@ mod tests {
             clean_guitar: false,
             transcriber: "basic-pitch",
             muscriptor_model: None,
+            hf_token: HfToken::default(),
         };
         let job = Job::start(native_backend(), options).unwrap();
         loop {

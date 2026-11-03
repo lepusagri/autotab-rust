@@ -140,8 +140,17 @@ Model access is gated. Accept the conditions separately on the
 [Small](https://huggingface.co/MuScriptor/muscriptor-small),
 [Medium](https://huggingface.co/MuScriptor/muscriptor-medium) and
 [Large](https://huggingface.co/MuScriptor/muscriptor-large) model pages. Downloads
-use `HF_TOKEN`, or an existing Hugging Face token file (`HF_TOKEN_PATH` or
-`HF_HOME/token`). AutoTab never writes the token to its configuration or logs.
+can use the **Hugging-Face-Token** field shown beneath **Notenerkennung** after
+selecting a MuScriptor model. The field is masked, with optional **Anzeigen** and
+**Leeren** controls and a link to create/manage tokens. The entered token is kept
+only for the current GUI session and passed to the backend process through its
+`HF_TOKEN` environment variable, never as a command-line argument. Output from
+that process redacts the entered token. AutoTab never saves it to a file.
+
+An empty field uses the existing authentication: `HF_TOKEN`, or an existing Hugging
+Face token file (`HF_TOKEN_PATH` or `HF_HOME/token`). The supplied token must belong
+to an account with access to the selected model. Entering a token does not grant
+model access automatically.
 The weights are **CC BY-NC 4.0**; the upstream inference code is MIT-licensed.
 No weights or credentials are included in this repository.
 

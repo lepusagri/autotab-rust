@@ -37,6 +37,8 @@ pub struct AutoTab {
     clean_guitar: bool,
     transcriber: usize,
     muscriptor_model: String,
+    hf_token: String,
+    show_hf_token: bool,
     job: Option<Job>,
     status: String,
     error: Option<String>,
@@ -85,6 +87,8 @@ impl AutoTab {
             clean_guitar: false,
             transcriber: 0,
             muscriptor_model: String::new(),
+            hf_token: String::new(),
+            show_hf_token: false,
             job: None,
             status: "Bereit für deine Audiodatei".into(),
             error: None,
@@ -140,6 +144,11 @@ impl AutoTab {
             threads: self.threads,
             clean_guitar: self.clean_guitar,
             transcriber: TRANSCRIBERS[self.transcriber].1,
+            hf_token: if self.transcriber > 0 {
+                job::HfToken::new(&self.hf_token)
+            } else {
+                job::HfToken::default()
+            },
             muscriptor_model: if self.transcriber > 0 && !self.muscriptor_model.trim().is_empty() {
                 Some(PathBuf::from(self.muscriptor_model.trim()))
             } else {
@@ -275,9 +284,24 @@ impl AutoTab {
                 });
             });
             if self.transcriber > 0 {
+                let token_label = ui.label("Hugging-Face-Token (optional)");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.hf_token)
+                        .password(!self.show_hf_token)
+                        .desired_width((ui.available_width() - 205.0).max(180.0))
+                        .hint_text("hf_… · leer = vorhandene Hugging-Face-Anmeldung"))
+                        .labelled_by(token_label.id);
+                    ui.checkbox(&mut self.show_hf_token, "Anzeigen");
+                    if ui.button("Leeren").clicked() {
+                        self.hf_token.clear();
+                        self.show_hf_token = false;
+                    }
+                });
+                ui.label(RichText::new("Nur für diese Sitzung. Verwende den Token des Kontos mit Modellfreigabe.").small().color(MUTED));
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("MuScriptor: CC BY-NC 4.0 · Modellfreigabe und Hugging-Face-Anmeldung für den Download erforderlich.").small().color(MUTED));
+                    ui.label(RichText::new("MuScriptor: CC BY-NC 4.0 · Modellfreigabe für den Download erforderlich.").small().color(MUTED));
                     ui.hyperlink_to("Modellseite", format!("https://huggingface.co/MuScriptor/{}", TRANSCRIBERS[self.transcriber].1));
+                    ui.hyperlink_to("Token erstellen / verwalten", "https://huggingface.co/settings/tokens");
                 });
                 ui.label(RichText::new("Vorhandene Modelle werden aus dem lokalen Hugging-Face-Cache geladen.").small().color(MUTED));
             }
