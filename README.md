@@ -145,6 +145,12 @@ use `HF_TOKEN`, or an existing Hugging Face token file (`HF_TOKEN_PATH` or
 The weights are **CC BY-NC 4.0**; the upstream inference code is MIT-licensed.
 No weights or credentials are included in this repository.
 
+HTTPS downloads use the operating system's trusted root certificates (the Windows
+certificate store on Windows), including organization-managed roots. TLS
+certificate and hostname validation remain enabled. An `UnknownIssuer` error
+indicates a certificate trust problem; HTTP 401/403 instead indicates model access
+or authentication. No insecure TLS bypass is used.
+
 AutoTab first checks its `models/` folder and the standard Hugging Face snapshot
 cache, respecting `HF_HOME`, `HF_HUB_CACHE` and `HUGGINGFACE_HUB_CACHE`. Missing
 weights download automatically on first use. Alternatively, select a local
