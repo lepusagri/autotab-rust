@@ -6,6 +6,7 @@ mod inference;
 mod instruments;
 mod intel_gpu;
 mod muscriptor;
+mod rhythm;
 mod separation;
 mod tab;
 mod tools;
@@ -51,6 +52,15 @@ struct Args {
     /// Expected MuScriptor instruments: comma/space-separated names or group IDs, or 'auto'
     #[arg(long, alias = "instrument-group", default_value = "4,5,6")]
     instruments: instruments::Instruments,
+    /// MuScriptor MIDI tempo in quarter notes per minute; does not time-stretch audio
+    #[arg(long, default_value_t = 120.0)]
+    bpm: f64,
+    /// MuScriptor MIDI time signature (e.g. 4/4, 3/4, 6/8)
+    #[arg(long, default_value = "4/4")]
+    time_signature: rhythm::Meter,
+    /// MuScriptor MIDI note grid; off preserves detected timing
+    #[arg(long, value_enum, default_value = "off")]
+    quantize: rhythm::Grid,
     /// Maximum CPU threads used by Demucs
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..))]
     threads: u16,
@@ -83,6 +93,16 @@ fn main() {
 
 fn run(args: Args) -> Result<()> {
     let total = Instant::now();
+    let rhythm = rhythm::Rhythm {
+        bpm: args.bpm,
+        meter: args.time_signature,
+        grid: args.quantize,
+    };
+    rhythm.validate()?;
+    ensure!(
+        args.transcriber.variant().is_some() || rhythm == rhythm::Rhythm::default(),
+        "--bpm, --time-signature and --quantize require a muscriptor-* --transcriber"
+    );
     ensure!(
         args.transcriber.variant().is_some()
             || args.instruments == instruments::Instruments::default(),
@@ -216,7 +236,7 @@ fn run(args: Args) -> Result<()> {
         notes.len()
     );
     let midi = if let Some(transcription) = multi_instrument {
-        transcription.to_midi()?
+        transcription.to_midi(&rhythm)?
     } else {
         basic_pitch::midi::note_events_to_midi_bytes(&notes, &Default::default())?
     };
@@ -244,7 +264,8 @@ fn run(args: Args) -> Result<()> {
             "precision": format!("{:?}", args.precision),
             "audio_seconds": audio_seconds, "separation_seconds": separation_seconds,
             "transcription_seconds": transcription_seconds, "total_seconds": elapsed,
-            "transcriber": format!("{:?}", args.transcriber), "instruments": args.instruments.to_string(), "notes": notes.len(), "midi_notes": midi_notes});
+            "transcriber": format!("{:?}", args.transcriber), "instruments": args.instruments.to_string(), "notes": notes.len(), "midi_notes": midi_notes,
+            "midi_bpm": rhythm.bpm, "time_signature": rhythm.meter.to_string(), "quantization": rhythm.grid.as_cli()});
         fs::write(path, serde_json::to_vec_pretty(&timing)?)?;
     }
     Ok(())
@@ -253,6 +274,30 @@ fn run(args: Args) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    #[test]
+    fn parses_muscriptor_rhythm_controls_and_rejects_invalid_meter() {
+        let args = Args::try_parse_from([
+            "autotab",
+            "--input",
+            "song.wav",
+            "--transcriber",
+            "muscriptor-small",
+            "--bpm",
+            "96",
+            "--time-signature",
+            "6/8",
+            "--quantize",
+            "16",
+        ])
+        .unwrap();
+        assert_eq!(args.bpm, 96.0);
+        assert_eq!(args.time_signature.to_string(), "6/8");
+        assert_eq!(args.quantize, rhythm::Grid::Sixteenth);
+        assert!(
+            Args::try_parse_from(["autotab", "--input", "song.wav", "--time-signature", "4/3"])
+                .is_err()
+        );
+    }
     #[test]
     fn accepts_instrument_names_ids_and_automatic_mode() {
         for (flag, value) in [

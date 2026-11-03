@@ -1,4 +1,5 @@
 use super::tokens::DetectedNote;
+use crate::rhythm::{Grid, PPQ, Rhythm};
 use anyhow::{Result, ensure};
 use basic_pitch::{
     NoteEvent,
@@ -22,15 +23,27 @@ impl Transcription {
             .collect()
     }
 
-    pub fn to_midi(&self) -> Result<Vec<u8>> {
+    pub fn to_midi(&self, rhythm: &Rhythm) -> Result<Vec<u8>> {
+        let tempo = rhythm.tempo_micros()?;
+        let signature = (
+            rhythm.meter.numerator,
+            rhythm.meter.midi_denominator(),
+            rhythm.meter.metronome(),
+        );
         let mut groups: BTreeMap<u8, Vec<&NoteEvent>> = BTreeMap::new();
         for note in &self.notes {
             groups.entry(note.program).or_default().push(&note.note);
         }
         let mut tracks = vec![vec![
+            event(0, TrackEventKind::Meta(MetaMessage::Tempo(u24::new(tempo))))?,
             event(
                 0,
-                TrackEventKind::Meta(MetaMessage::Tempo(u24::new(500_000))),
+                TrackEventKind::Meta(MetaMessage::TimeSignature(
+                    signature.0,
+                    signature.1,
+                    signature.2,
+                    8,
+                )),
             )?,
             event(0, TrackEventKind::Meta(MetaMessage::EndOfTrack))?,
         ]];
@@ -67,6 +80,20 @@ impl Transcription {
                     TrackEventKind::Meta(MetaMessage::TrackName(name.as_bytes())),
                 )?,
             ];
+            // Some notation software ignores a conductor tempo without notes.
+            track.push(event(
+                0,
+                TrackEventKind::Meta(MetaMessage::Tempo(u24::new(tempo))),
+            )?);
+            track.push(event(
+                0,
+                TrackEventKind::Meta(MetaMessage::TimeSignature(
+                    signature.0,
+                    signature.1,
+                    signature.2,
+                    8,
+                )),
+            )?);
             if program != 128 {
                 track.push(event(
                     0,
@@ -78,7 +105,7 @@ impl Transcription {
                     },
                 )?);
             }
-            let mut timed = Vec::new();
+            let mut by_pitch: BTreeMap<u8, Vec<(u64, u64)>> = BTreeMap::new();
             for note in notes {
                 ensure!(
                     note.start_s.is_finite()
@@ -88,10 +115,30 @@ impl Transcription {
                         && note.pitch <= 127,
                     "Invalid MuScriptor MIDI note"
                 );
-                let start = (note.start_s * 960.0).round() as u64;
-                let end = ((note.end_s * 960.0).round() as u64).max(start + 1);
-                timed.push((start, 1_u8, note.pitch));
-                timed.push((end, 0_u8, note.pitch));
+                let span = rhythm.note_ticks(note.start_s, note.end_s)?;
+                by_pitch.entry(note.pitch).or_default().push(span);
+            }
+            let mut timed = Vec::new();
+            for (pitch, mut spans) in by_pitch {
+                spans.sort_unstable();
+                if rhythm.grid != Grid::Off {
+                    let mut cleaned: Vec<(u64, u64)> = Vec::new();
+                    for (start, end) in spans {
+                        if let Some(previous) = cleaned.last_mut() {
+                            if previous.0 == start {
+                                previous.1 = previous.1.max(end);
+                                continue;
+                            }
+                            previous.1 = previous.1.min(start);
+                        }
+                        cleaned.push((start, end));
+                    }
+                    spans = cleaned;
+                }
+                for (start, end) in spans {
+                    timed.push((start, 1_u8, pitch));
+                    timed.push((end, 0_u8, pitch));
+                }
             }
             timed.sort_unstable(); // Note-off precedes note-on at the same tick.
             let mut previous = 0;
@@ -117,7 +164,7 @@ impl Transcription {
             tracks.push(track);
         }
         let smf = Smf {
-            header: Header::new(Format::Parallel, Timing::Metrical(u15::new(480))),
+            header: Header::new(Format::Parallel, Timing::Metrical(u15::new(PPQ))),
             tracks,
         };
         let mut bytes = Vec::new();
@@ -155,6 +202,101 @@ mod tests {
         }
     }
     #[test]
+    fn exports_requested_tempo_meter_and_quantized_ticks_on_every_instrument() {
+        let mut note = fixture(0, 60);
+        note.note.start_s = 0.14;
+        note.note.end_s = 0.18;
+        let mut guitar = note.clone();
+        guitar.program = 24;
+        let transcription = Transcription {
+            notes: vec![note, guitar],
+        };
+        let rhythm = Rhythm {
+            bpm: 96.0,
+            meter: "6/8".parse().unwrap(),
+            grid: Grid::Sixteenth,
+        };
+        let bytes = transcription.to_midi(&rhythm).unwrap();
+        let midi = Smf::parse(&bytes).unwrap();
+        assert!(midi.tracks[0].iter().any(|event| matches!(event.kind,
+            TrackEventKind::Meta(MetaMessage::Tempo(value)) if value.as_int() == 625_000)));
+        assert!(midi.tracks[0].iter().any(|event| matches!(
+            event.kind,
+            TrackEventKind::Meta(MetaMessage::TimeSignature(6, 3, 36, 8))
+        )));
+        for track in &midi.tracks[1..] {
+            let mut tick = 0;
+            let mut notes = Vec::new();
+            for event in track {
+                tick += event.delta.as_int();
+                match event.kind {
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOn { .. },
+                        ..
+                    } => notes.push((tick, true)),
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOff { .. },
+                        ..
+                    } => notes.push((tick, false)),
+                    _ => (),
+                }
+            }
+            assert_eq!(notes, [(120, true), (240, false)]);
+        }
+    }
+
+    #[test]
+    fn quantization_merges_same_pitch_collisions_without_duplicate_note_on_events() {
+        let mut first = fixture(24, 60);
+        first.note.start_s = 0.01;
+        first.note.end_s = 0.02;
+        let mut second = first.clone();
+        second.note.start_s = 0.03;
+        second.note.end_s = 0.04;
+        let transcription = Transcription {
+            notes: vec![first, second],
+        };
+        let rhythm = Rhythm {
+            grid: Grid::Sixteenth,
+            ..Rhythm::default()
+        };
+        let bytes = transcription.to_midi(&rhythm).unwrap();
+        let midi = Smf::parse(&bytes).unwrap();
+        let ons = midi.tracks[1]
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOn { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        let offs = midi.tracks[1]
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TrackEventKind::Midi {
+                        message: MidiMessage::NoteOff { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!((ons, offs), (1, 1));
+        assert_eq!(
+            midi.tracks[1]
+                .iter()
+                .map(|event| event.delta.as_int())
+                .sum::<u32>(),
+            120
+        );
+    }
+
+    #[test]
     fn keeps_piano_guitar_bass_and_drums_but_tabs_use_only_guitar() {
         let transcription = Transcription {
             notes: vec![
@@ -172,7 +314,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [64]
         );
-        let bytes = transcription.to_midi().unwrap();
+        let bytes = transcription.to_midi(&Rhythm::default()).unwrap();
         let midi = Smf::parse(&bytes).unwrap();
         assert_eq!(midi.tracks.len(), 5);
         let programs: Vec<_> = midi
@@ -199,7 +341,7 @@ mod tests {
         let transcription = Transcription {
             notes: (0..17).map(|program| fixture(program, 60)).collect(),
         };
-        let bytes = transcription.to_midi().unwrap();
+        let bytes = transcription.to_midi(&Rhythm::default()).unwrap();
         let midi = Smf::parse(&bytes).unwrap();
         assert_eq!(midi.tracks.len(), 18);
         assert!(

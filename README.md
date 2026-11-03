@@ -130,6 +130,33 @@ remain available. MuScriptor defaults to the acoustic / clean electric / distort
 electric guitar groups. Its notes use fixed MIDI velocity, without estimated
 dynamics or pitch bends. Fret assignment still uses the tab heuristic.
 
+### MIDI tempo, time signature and note grid
+
+For MuScriptor, the GUI offers **Tempo (BPM)**, **Taktart** and **Notenraster**.
+Tempo is measured in **quarter notes per minute**, including in meters such as
+6/8. The time-signature numerator can be 1–32; the denominator can be 1, 2, 4, 8,
+16, 32 or 64. Examples are 4/4, 3/4, 5/4 and 6/8.
+
+```powershell
+.\run-rust.cmd --input "C:\Music\song.wav" --transcriber muscriptor-small --bpm 96 --time-signature 6/8 --quantize sixteenth
+# Eighth-note grid (aliases: 8 or 1/8):
+.\run-rust.cmd --input "C:\Music\song.wav" --transcriber muscriptor-small --bpm 120 --time-signature 4/4 --quantize eighth
+```
+
+`--quantize off` is the default: the detected note times in seconds are preserved
+to MIDI tick resolution when changing tempo or meter metadata. `eighth` / `8`
+snaps note starts and ends to an eighth-note grid; `sixteenth` / `16` uses a
+sixteenth-note grid. Longer notes can span several grid steps. Quantized notes
+last at least one step; same-pitch notes that collapse to one onset within the
+same instrument are merged, and overlapping repeated notes are trimmed to avoid
+conflicting note-on/off pairs. All instrument tracks use the same grid.
+
+These are manual MIDI export settings, independent of model inference. No
+automatic tempo/downbeat tracking is added. The grid starts at the beginning of
+the recording; changing BPM alone does not time-stretch the audio or MIDI.
+The MIDI records tempo and meter explicitly. ASCII tablature keeps its existing
+layout and does not display rhythmic notation. Default: 120 BPM, 4/4, grid off.
+
 ### Expected instruments and multi-instrument MIDI
 
 In the GUI, use **Erwartete Instrumente** to select multiple instrument groups, or

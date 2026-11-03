@@ -9,6 +9,9 @@ mod instruments;
 mod job;
 #[path = "../gui/playback.rs"]
 mod playback;
+#[path = "../rhythm.rs"]
+#[allow(dead_code)] // Export timing helpers are used by the CLI backend.
+mod rhythm;
 
 fn main() {
     let options = eframe::NativeOptions {

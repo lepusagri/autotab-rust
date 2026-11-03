@@ -101,11 +101,13 @@ pub struct Options {
     pub muscriptor_model: Option<PathBuf>,
     pub hf_token: HfToken,
     pub instruments: crate::instruments::Instruments,
+    pub rhythm: crate::rhythm::Rhythm,
 }
 
 impl Options {
     pub fn validate(&self) -> Result<()> {
         self.hf_token.validate()?;
+        self.rhythm.validate()?;
         if let Some(path) = &self.muscriptor_model {
             ensure!(
                 path.is_file(),
@@ -171,6 +173,14 @@ impl Options {
         if self.transcriber.starts_with("muscriptor-") {
             args.push("--instruments".into());
             args.push(self.instruments.to_string().into());
+            for (flag, value) in [
+                ("--bpm", self.rhythm.bpm.to_string()),
+                ("--time-signature", self.rhythm.meter.to_string()),
+                ("--quantize", self.rhythm.grid.as_cli().to_owned()),
+            ] {
+                args.push(flag.into());
+                args.push(value.into());
+            }
         }
         if let Some(path) = &self.muscriptor_model {
             args.push("--muscriptor-model".into());
@@ -427,8 +437,24 @@ mod tests {
             instruments: "acoustic_piano,acoustic_guitar,acoustic_bass"
                 .parse()
                 .unwrap(),
+            rhythm: crate::rhythm::Rhythm {
+                bpm: 96.0,
+                meter: "6/8".parse().unwrap(),
+                grid: crate::rhythm::Grid::Sixteenth,
+            },
         };
         let arguments = options.arguments().unwrap();
+        for pair in [
+            ("--bpm", "96"),
+            ("--time-signature", "6/8"),
+            ("--quantize", "sixteenth"),
+        ] {
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|arguments| arguments == [OsString::from(pair.0), OsString::from(pair.1)])
+            );
+        }
         assert!(!arguments.iter().any(|argument| {
             argument
                 .to_string_lossy()
@@ -551,6 +577,7 @@ mod tests {
             muscriptor_model: None,
             hf_token: HfToken::default(),
             instruments: crate::instruments::Instruments::default(),
+            rhythm: crate::rhythm::Rhythm::default(),
         };
         let job = Job::start(native_backend(), options).unwrap();
         let mut saw_gpu = false;
@@ -587,6 +614,7 @@ mod tests {
             muscriptor_model: None,
             hf_token: HfToken::default(),
             instruments: crate::instruments::Instruments::default(),
+            rhythm: crate::rhythm::Rhythm::default(),
         };
         let job = Job::start(native_backend(), options).unwrap();
         loop {

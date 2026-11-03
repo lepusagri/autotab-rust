@@ -42,6 +42,7 @@ pub struct AutoTab {
     show_hf_token: bool,
     instrument_groups: Vec<bool>,
     automatic_instruments: bool,
+    rhythm: crate::rhythm::Rhythm,
     job: Option<Job>,
     status: String,
     error: Option<String>,
@@ -97,6 +98,7 @@ impl AutoTab {
                 .map(|group| (4..=6).contains(&group.id))
                 .collect(),
             automatic_instruments: false,
+            rhythm: crate::rhythm::Rhythm::default(),
             job: None,
             status: "Bereit für deine Audiodatei".into(),
             error: None,
@@ -160,6 +162,11 @@ impl AutoTab {
             clean_guitar: self.clean_guitar,
             transcriber: TRANSCRIBERS[self.transcriber].1,
             instruments,
+            rhythm: if self.transcriber > 0 {
+                self.rhythm
+            } else {
+                crate::rhythm::Rhythm::default()
+            },
             hf_token: if self.transcriber > 0 {
                 job::HfToken::new(&self.hf_token)
             } else {
@@ -327,6 +334,25 @@ impl AutoTab {
                     });
                 });
                 ui.label(RichText::new("MIDI: alle erkannten Instrumente als getrennte Spuren. Tabulatur: Gitarrennoten.").small().color(MUTED));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Tempo (BPM)").on_hover_text("Viertelnoten pro Minute; keine Änderung der Audio-Geschwindigkeit.");
+                    ui.add(egui::DragValue::new(&mut self.rhythm.bpm).range(4.0..=1000.0).speed(0.5).max_decimals(2));
+                    ui.label("Taktart");
+                    ui.add(egui::DragValue::new(&mut self.rhythm.meter.numerator).range(1..=32));
+                    ui.label("/");
+                    egui::ComboBox::from_id_salt("meter_denominator").selected_text(self.rhythm.meter.denominator.to_string()).width(50.0).show_ui(ui, |ui| {
+                        for denominator in [1, 2, 4, 8, 16, 32, 64] {
+                            ui.selectable_value(&mut self.rhythm.meter.denominator, denominator, denominator.to_string());
+                        }
+                    });
+                    ui.label("Notenraster");
+                    let choices = [(crate::rhythm::Grid::Off, "Aus – Originaltiming"), (crate::rhythm::Grid::Eighth, "Achtel (1/8)"), (crate::rhythm::Grid::Sixteenth, "Sechzehntel (1/16)")];
+                    let label = choices.iter().find(|(grid, _)| *grid == self.rhythm.grid).unwrap().1;
+                    egui::ComboBox::from_id_salt("note_grid").selected_text(label).width(165.0).show_ui(ui, |ui| {
+                        for (grid, label) in choices { ui.selectable_value(&mut self.rhythm.grid, grid, label); }
+                    });
+                });
+                ui.label(RichText::new("BPM = Viertelnoten/min. MIDI-Raster ab Dateianfang; ASCII-Tabs haben keine Rhythmusnotation.").small().color(MUTED));
                 let token_label = ui.label("Hugging-Face-Token (optional)");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.hf_token)
