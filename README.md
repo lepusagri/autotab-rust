@@ -1,9 +1,12 @@
 # AutoTab in Rust
 
-Local audio-to-guitar-tab transcription, **without Python**. The Rust executable
+Local audio/MIDI-to-guitar-tab transcription, **without Python**. Existing MIDI
+files go directly to fingering search, without audio decoding or transcription.
+For audio, the Rust executable
 runs the six-stem Demucs ONNX model for guitar separation, Basic Pitch for note
-recognition, and the existing string/fret heuristic for ASCII tablature. It also
-writes a MIDI file.
+recognition, and a pretrained tab-labeler v3 model plus constrained fingering
+search. It writes ASCII tablature, playable Guitar Pro 5 notation, MIDI, and a
+fingering/verification report. No local model training is required.
 
 Note recognition can use **Basic Pitch**, **MuScriptor Small**, **MuScriptor Medium**
 or **MuScriptor Large**. All four run natively from Rust without a Python process.
@@ -20,10 +23,11 @@ For the desktop interface, double-click **`run-gui.cmd`** or run:
 .\run-gui.cmd
 ```
 
-The German interface offers an audio file picker / drag-and-drop, an optional
+The German interface offers an audio/MIDI file picker / drag-and-drop, an optional
 audio URL, tuning and Intel Arc/CPU selection, output folder, live status,
-cancellation, tab preview, clipboard copy and an output-folder button. Tab and
-MIDI files receive a new filename when an earlier result already exists.
+cancellation, tab preview, clipboard copy, a **Griffpositionen** model selector,
+and **Guitar Pro öffnen** for generated GP5 files. All four output files receive
+a new filename stem when an earlier result already exists.
 The GUI invokes the same native Rust backend in the background; processing and
 FFmpeg run without extra console windows. Closing the GUI cancels an active job.
 
@@ -54,9 +58,106 @@ temporary directory and are removed automatically. Concurrent jobs should use
 separate output filenames.
 
 Tunings: `standard`, `drop_d`, `d_standard`, `half_step_down`, `eb_standard`.
-The tab layout retains the Python version's greedy fret assignment; it does not
-preserve rhythmic spacing or guarantee optimal fingering. Notes outside the
-supported fretboard may be omitted. MIDI preserves the recognized note timing.
+ASCII columns show onset groups, not rhythmic spacing. GP5 carries actual rhythmic
+notation with the assigned strings/frets; MIDI retains recognized timing unless
+quantization is selected. Notes outside the fretboard are explicitly reported and
+retained in MIDI and the JSON source-note list.
+
+## Existing MIDI files
+
+Select a `.mid` or `.midi` under **Datei** (or drag it into the window), choose
+**MIDI-Spur**, keep **KI-Modell v3**, and click **Tabs erstellen**. MIDI skips
+FFmpeg, Demucs, Basic Pitch and MuScriptor entirely. Only the small tab-labeler
+model and native ONNX Runtime are needed. Audio-specific options are hidden or
+disabled; tempo, meter and note timing come from the file.
+
+**Automatisch** selects notes on General MIDI guitar programs 24..31 (zero-based).
+If none are present, it uses all melodic notes. **Alle melodischen Spuren** and
+individual named tracks can also be selected. Drum channel 10 is always excluded.
+Track numbers are the zero-based physical SMF track indices; a type-0 file may
+contain multiple MIDI channels inside its single track. MIDI ports and per-channel
+program changes are respected when selecting guitar notes.
+
+```powershell
+# Inspect track names and note counts; no model inference or download:
+.\run-rust.cmd --input "C:\Music\song.mid" --list-midi-tracks
+# Automatic guitar selection:
+.\run-rust.cmd --input "C:\Music\song.mid" --tab-engine v3
+# Select physical track 1 (track 0 is often the conductor/tempo track):
+.\run-rust.cmd --input "C:\Music\song.mid" --midi-track 1 --tab-engine v3
+# Include every non-drum note:
+.\run-rust.cmd --input "C:\Music\song.mid" --midi-track all
+```
+
+Outputs are the same `.txt`, `.gp5`, `.mid` and `.fingering.json` files. The MIDI
+preview contains only the selected notes, with their original ticks, velocities,
+tempo/meter maps and selected-channel controls. The input file is left unchanged;
+an output path resolving to the input is rejected. JSON records original ticks,
+tracks, channels, ports, programs and the fingering assignments.
+
+GP5 uses original musical beat positions, including tempo changes and meter
+changes at measure boundaries. As for audio, GP5 timing is quantized to 1/32 and
+BPM to integers. The MIDI preview retains original timing. Pitch bends and other
+controllers are retained in the MIDI preview but are not converted to GP5 playing
+techniques. Guitar fingering considers note-on/off spans, not sustain-pedal tails.
+
+Supported input: standard SMF types 0 and 1 with metrical PPQ timing. Type 2,
+SMPTE timing and zero-length notes are rejected explicitly. Missing note-offs
+are closed at track end and reported. The current GP5 writer requires initial
+tempo 4..1000 BPM, subsequent tempo changes 1..255 BPM, and meter changes at
+measure boundaries; unsupported changes fail visibly rather than changing the
+score silently. `--bpm`, `--time-signature` and `--quantize` are audio-only controls
+when a MIDI file is imported.
+
+## Fingering and Guitar Pro export
+
+The default **KI-Modell v3** / `--tab-engine v3` uses
+[`cstr/tab-labeler-onnx`](https://huggingface.co/cstr/tab-labeler-onnx), file
+`tab-labeler-v3-egset.onnx` (GuitarSet + EGSet12, ~1.3 MB). The first nonempty
+guitar result downloads revision `434976baacaf194d99f09c3c784682766bedcf97`,
+verified against SHA-256
+`93114786c6f4781e7a0b69abd7e93a0d4966873f8e54908f97a1de8e8cf788af`.
+Weights are cached in `models/`; subsequent inference is local on CPU through
+the existing ONNX Runtime. Credit: **cstr**; weights: **CC BY 4.0**. Model credit
+and license are retained in the text, JSON and GP5 metadata.
+
+The model scores candidate positions; a 64-state beam search penalizes hand
+movement and fret spread. It enforces one sounding note per string, a maximum
+seven-fret span (excluding open strings), and frets 0..19. Excess chord notes or
+notes blocked by sustained strings are preserved as additional guitar voices.
+Grips spanning more than four frets are reported for manual review. Fingering
+is approximate and does not guarantee comfortable playing or original artist
+fingerings. The model was trained for standard tuning; the other tunings are
+experimental. Pitches outside its 40..88 input range use rule-based costs where
+the requested fretboard can represent them.
+
+Choose **Regelbasierte Griffsuche** / `--tab-engine simple` for the same bounded
+search without model scores or a weight download:
+
+```powershell
+.\run-rust.cmd --input "C:\Music\guitar.wav" --skip-separation --tab-engine v3 --bpm 120 --time-signature 4/4
+.\run-rust.cmd --input "C:\Music\guitar.wav" --skip-separation --tab-engine simple
+```
+
+For `song_tab.txt`, the additional files are `song_tab.mid`, `song_tab.gp5`, and
+`song_tab.fingering.json`. Double-click the `.gp5` or use **Guitar Pro öffnen**
+in the GUI. GP5 preserves explicit fingerings and tied notes across bars. It
+rounds timing to a 1/32 grid (or a selected coarser grid) and tempo to integer BPM.
+Quantization collisions are kept on additional GP5 tracks rather than losing
+attacks. The JSON reports timing displacement, additional voices, wide grips,
+unassigned source indices, and every source note. GP5 is read back before saving
+to verify note attacks, string/fret assignments and quantized start/end times.
+MIDI retains non-guitar instruments; the GP5 contains the guitar arrangement.
+
+Tempo/meter/grid controls are available for both Basic Pitch and MuScriptor.
+Tempo and downbeats are manual settings; there is no automatic beat tracking.
+
+Opt-in native model/export smoke test (requires the local runtime and internet
+on the first model download):
+
+```powershell
+.\cargo-local.ps1 @('test', '--locked', '--features', 'gui', '--bin', 'autotab', 'native_v3_gp5_roundtrip', '--', '--ignored', '--nocapture')
+```
 
 ## Setup / rebuild
 
@@ -306,8 +407,9 @@ Local media transcription and direct HTTP downloads have passed their tests.
 
 ## Validation
 
-Five Rust tests cover chord grouping, tunings, overlap-add boundaries, direct HTTP
-download and URL scheme validation. `cargo clippy --all-targets -- -D warnings` and
+Rust tests cover model input/scoring, constrained fingerings, extra voices, GP5
+ties and rhythmic values, multi-instrument MIDI, overlap-add boundaries, direct
+HTTP download and URL scheme validation. `cargo clippy --all-targets -- -D warnings` and
 format checks pass. `test-rust.ps1` generates a nine-second MP3, exercises two Demucs
 chunks and clean-guitar transcription, and checks the resulting MIDI headers and
 tab files. The complete pipeline uses only the Rust executable and native FFmpeg /
@@ -349,6 +451,8 @@ are excluded. Setup downloads the required runtime assets locally.
 - [basic-pitch-rs](https://github.com/AThevon/basic-pitch-rs): Apache-2.0, includes the official Spotify Basic Pitch model and Rust post-processing.
 - [MuScriptor](https://github.com/muscriptor/muscriptor): MIT code; the native implementation adapts its architecture, preprocessing and event decoder. The [MIT notice](docs/licenses/muscriptor-MIT.txt) is retained. Hugging Face model weights are separately gated and CC BY-NC 4.0.
 - [ONNX Runtime](https://github.com/microsoft/onnxruntime): MIT.
+- [tab-labeler v3](https://huggingface.co/cstr/tab-labeler-onnx): cstr, CC BY 4.0; trained on GuitarSet and EGSet12.
+- [guitarpro Rust library](https://codeberg.org/slundi/scorelib): MIT; native GP5 encoding and reading.
 - [OpenVINO](https://github.com/openvinotoolkit/openvino) and [Rust bindings](https://github.com/intel/openvino-rs): Apache-2.0.
 - [FFmpeg Windows essentials build](https://www.gyan.dev/ffmpeg/builds/): see the build's bundled license; this distribution includes GPL components.
 - [rusty_ytdl](https://github.com/Mithronn/rusty_ytdl): MIT.

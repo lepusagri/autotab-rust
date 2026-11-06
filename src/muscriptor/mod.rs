@@ -13,6 +13,7 @@ use anyhow::{Result, ensure};
 use clap::ValueEnum;
 pub use midi::Transcription;
 use std::path::Path;
+pub use tokens::DetectedNote;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub enum Transcriber {

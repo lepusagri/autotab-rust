@@ -2,9 +2,12 @@
 
 mod audio;
 mod download;
+mod fingering;
+mod gp5;
 mod inference;
 mod instruments;
 mod intel_gpu;
+mod midi_input;
 mod muscriptor;
 mod rhythm;
 mod separation;
@@ -19,18 +22,27 @@ use std::{fs, path::PathBuf, sync::Arc, time::Instant};
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Turn audio into guitar tabs locally, without Python."
+    about = "Turn audio or MIDI into guitar tabs locally, without Python."
 )]
 #[command(group(ArgGroup::new("source").required(true).args(["input", "url"])))]
 struct Args {
-    /// Audio file (MP3, WAV, FLAC, etc.)
+    /// Audio or MIDI file (MP3, WAV, MID, MIDI, etc.)
     #[arg(long)]
     input: Option<PathBuf>,
+    /// MIDI selection: auto (guitar programs, otherwise melodic notes), all, or zero-based track index
+    #[arg(long, default_value = "auto")]
+    midi_track: midi_input::Selection,
+    /// List MIDI tracks and exit, without model inference
+    #[arg(long)]
+    list_midi_tracks: bool,
     /// Direct HTTP(S) audio URL or public YouTube video URL
     #[arg(long)]
     url: Option<String>,
     #[arg(long, value_enum, default_value = "standard")]
     tuning: tab::Tuning,
+    /// Fingering engine: pretrained tab-labeler v3 or offline rule-based search
+    #[arg(long, value_enum, default_value = "v3")]
+    tab_engine: fingering::Engine,
     /// Tab output path (default: output/<input>_tab.txt)
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -52,13 +64,13 @@ struct Args {
     /// Expected MuScriptor instruments: comma/space-separated names or group IDs, or 'auto'
     #[arg(long, alias = "instrument-group", default_value = "4,5,6")]
     instruments: instruments::Instruments,
-    /// MuScriptor MIDI tempo in quarter notes per minute; does not time-stretch audio
+    /// Score/MIDI tempo in quarter notes per minute; does not time-stretch audio
     #[arg(long, default_value_t = 120.0)]
     bpm: f64,
-    /// MuScriptor MIDI time signature (e.g. 4/4, 3/4, 6/8)
+    /// Score/MIDI time signature (e.g. 4/4, 3/4, 6/8)
     #[arg(long, default_value = "4/4")]
     time_signature: rhythm::Meter,
-    /// MuScriptor MIDI note grid; off preserves detected timing
+    /// MIDI note grid; GP5 always uses at least a 1/32 notation grid
     #[arg(long, value_enum, default_value = "off")]
     quantize: rhythm::Grid,
     /// Maximum CPU threads used by Demucs
@@ -92,6 +104,18 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<()> {
+    if let Some(input) = args
+        .input
+        .as_ref()
+        .filter(|p| midi_input::is_midi(p))
+        .cloned()
+    {
+        return run_midi(args, input);
+    }
+    ensure!(
+        !args.list_midi_tracks && args.midi_track == midi_input::Selection::Auto,
+        "--midi-track and --list-midi-tracks require a .mid or .midi input"
+    );
     let total = Instant::now();
     let rhythm = rhythm::Rhythm {
         bpm: args.bpm,
@@ -99,10 +123,6 @@ fn run(args: Args) -> Result<()> {
         grid: args.quantize,
     };
     rhythm.validate()?;
-    ensure!(
-        args.transcriber.variant().is_some() || rhythm == rhythm::Rhythm::default(),
-        "--bpm, --time-signature and --quantize require a muscriptor-* --transcriber"
-    );
     ensure!(
         args.transcriber.variant().is_some()
             || args.instruments == instruments::Instruments::default(),
@@ -160,6 +180,21 @@ fn run(args: Args) -> Result<()> {
     let midi_output = args
         .midi_output
         .unwrap_or_else(|| output.with_extension("mid"));
+    let gp5_output = output.with_extension("gp5");
+    let fingering_output = output.with_extension("fingering.json");
+    let generated = [&output, &midi_output, &gp5_output, &fingering_output];
+    for (index, path) in generated.iter().enumerate() {
+        ensure!(
+            **path != input && generated[..index].iter().all(|other| other != path),
+            "Input, tab, MIDI, GP5 and fingering paths must differ"
+        );
+    }
+    if let Some(path) = &args.timings_json {
+        ensure!(
+            *path != input && !generated.contains(&path),
+            "Timing report must use a separate output path"
+        );
+    }
     ensure!(
         output != midi_output && output != input && midi_output != input,
         "Input, MIDI and tab paths must differ"
@@ -235,18 +270,51 @@ fn run(args: Args) -> Result<()> {
         "[4/4] Writing MIDI ({midi_notes} notes) and guitar tab ({} notes)...",
         notes.len()
     );
+    let arrangement = fingering::run(
+        &notes,
+        args.tuning,
+        args.tab_engine,
+        &home,
+        &environment,
+        &config,
+    )?;
+    let (gp5, gp5_report) = gp5::export(&arrangement, args.tuning, rhythm, &stem)?;
     let midi = if let Some(transcription) = multi_instrument {
         transcription.to_midi(&rhythm)?
     } else {
-        basic_pitch::midi::note_events_to_midi_bytes(&notes, &Default::default())?
+        muscriptor::Transcription {
+            notes: notes
+                .iter()
+                .cloned()
+                .map(|note| muscriptor::DetectedNote { program: 24, note })
+                .collect(),
+        }
+        .to_midi(&rhythm)?
     };
     tools::create_parent(&output)?;
     tools::create_parent(&midi_output)?;
     fs::write(&midi_output, midi)
         .with_context(|| format!("Cannot write {}", midi_output.display()))?;
-    fs::write(&output, tab::render(&notes, args.tuning))
+    fs::write(&output, fingering::render(&arrangement))
         .with_context(|| format!("Cannot write {}", output.display()))?;
-    println!("Tab: {}\nMIDI: {}", output.display(), midi_output.display());
+    fs::write(&gp5_output, gp5)?;
+    let report = serde_json::json!({
+        "engine": args.tab_engine, "model": matches!(args.tab_engine, fingering::Engine::V3).then_some(fingering::MODEL),
+        "tuning_low_to_high": args.tuning.pitches(),
+        "model_revision": matches!(args.tab_engine, fingering::Engine::V3).then_some(fingering::REVISION),
+        "model_credit": matches!(args.tab_engine, fingering::Engine::V3).then_some("cstr; CC BY 4.0"),
+        "arrangement": arrangement, "gp5": gp5_report,
+        "source_notes": notes.iter().enumerate().map(|(index, n)| serde_json::json!({
+            "index": index, "pitch": n.pitch, "start_s": n.start_s, "end_s": n.end_s,
+            "amplitude": n.amplitude })).collect::<Vec<_>>()
+    });
+    fs::write(fingering_output, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "Tab: {}\nMIDI: {}\nGuitar Pro: {}",
+        output.display(),
+        midi_output.display(),
+        gp5_output.display()
+    );
     if notes.is_empty() && midi_notes > 0 {
         println!(
             "No guitar notes detected. Other recognized instruments are retained in the MIDI."
@@ -267,6 +335,140 @@ fn run(args: Args) -> Result<()> {
             "transcriber": format!("{:?}", args.transcriber), "instruments": args.instruments.to_string(), "notes": notes.len(), "midi_notes": midi_notes,
             "midi_bpm": rhythm.bpm, "time_signature": rhythm.meter.to_string(), "quantization": rhythm.grid.as_cli()});
         fs::write(path, serde_json::to_vec_pretty(&timing)?)?;
+    }
+    Ok(())
+}
+
+fn run_midi(args: Args, input: PathBuf) -> Result<()> {
+    let started = Instant::now();
+    println!("[1/4] Reading MIDI...");
+    let source = midi_input::MidiFile::read(&input)?;
+    if args.list_midi_tracks {
+        for track in &source.tracks {
+            println!(
+                "Track {}: {} - {} melodic notes, {} guitar notes, {} drum notes",
+                track.index, track.name, track.melodic_notes, track.guitar_notes, track.drum_notes
+            );
+        }
+        return Ok(());
+    }
+    ensure!(
+        args.bpm == 120.0
+            && args.time_signature == rhythm::Meter::default()
+            && args.quantize == rhythm::Grid::Off,
+        "MIDI tempo, meter and note times are imported from the file; --bpm, --time-signature and --quantize are audio settings"
+    );
+    let selected = source.select(args.midi_track)?;
+    let notes: Vec<_> = selected.iter().map(|n| n.note.clone()).collect();
+    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+    let output = args
+        .output
+        .unwrap_or_else(|| PathBuf::from("output").join(format!("{stem}_tab.txt")));
+    let midi_output = args
+        .midi_output
+        .unwrap_or_else(|| output.with_extension("mid"));
+    let gp5_output = output.with_extension("gp5");
+    let report_output = output.with_extension("fingering.json");
+    validate_outputs(
+        &input,
+        &[&output, &midi_output, &gp5_output, &report_output],
+        args.timings_json.as_deref(),
+    )?;
+    println!(
+        "[2/4] Selected {} MIDI notes; no audio transcription or separation",
+        notes.len()
+    );
+    if source.repaired_note_offs > 0 {
+        println!(
+            "  {} unterminated notes closed at track end",
+            source.repaired_note_offs
+        );
+    }
+    let home = tools::project_home()?;
+    let config = inference::Config {
+        device: inference::Device::Cpu,
+        gpu_id: 0,
+        precision: inference::Precision::Fp32,
+        threads: usize::from(args.threads),
+        cache: home.join(".cache"),
+        profiles: args.profile_dir,
+        openvino_library: home.join("runtime/openvino-2026.4.1/openvino_c.dll"),
+    };
+    let environment = ort::init_from(config.device.runtime(&home))?
+        .with_name("autotab-midi")
+        .with_telemetry(false)
+        .build()?;
+    println!("[3/4] Computing guitar fingerings...");
+    let arrangement = fingering::run(
+        &notes,
+        args.tuning,
+        args.tab_engine,
+        &home,
+        &environment,
+        &config,
+    )?;
+    let (gp5, gp5_report) = gp5::export_midi(&arrangement, args.tuning, &source, &selected, &stem)?;
+    let midi = source.preview(&selected)?;
+    let report = serde_json::json!({
+        "input_type": "midi", "input": input, "selection": args.midi_track.to_string(),
+        "engine": args.tab_engine, "model": matches!(args.tab_engine, fingering::Engine::V3).then_some(fingering::MODEL),
+        "model_revision": matches!(args.tab_engine, fingering::Engine::V3).then_some(fingering::REVISION),
+        "model_credit": matches!(args.tab_engine, fingering::Engine::V3).then_some("cstr; CC BY 4.0"),
+        "tuning_low_to_high": args.tuning.pitches(), "arrangement": arrangement, "gp5": gp5_report,
+        "ticks_per_beat": source.ppq, "source_tracks": source.tracks, "tempos": source.tempos,
+        "meters": source.meters.iter().map(|m| serde_json::json!({"tick": m.tick, "meter": m.meter.to_string()})).collect::<Vec<_>>(),
+        "source_notes": selected.iter().enumerate().map(|(index,n)| serde_json::json!({
+            "index":index,"pitch":n.note.pitch,"start_s":n.note.start_s,"end_s":n.note.end_s,
+            "start_tick":n.start_tick,"end_tick":n.end_tick,"track":n.track,"channel":n.channel,"port":n.port,
+            "velocity":n.velocity,"program":n.program})).collect::<Vec<_>>() });
+    println!("[4/4] Writing tablature, Guitar Pro and selected MIDI preview...");
+    for path in [&output, &midi_output, &gp5_output, &report_output] {
+        tools::create_parent(path)?;
+    }
+    fs::write(&output, fingering::render(&arrangement))?;
+    fs::write(&midi_output, midi)?;
+    fs::write(&gp5_output, gp5)?;
+    fs::write(&report_output, serde_json::to_vec_pretty(&report)?)?;
+    println!(
+        "Tab: {}\nMIDI: {}\nGuitar Pro: {}\nMIDI conversion complete in {:.2}s",
+        output.display(),
+        midi_output.display(),
+        gp5_output.display(),
+        started.elapsed().as_secs_f64()
+    );
+    if let Some(path) = args.timings_json {
+        tools::create_parent(&path)?;
+        fs::write(
+            path,
+            serde_json::to_vec_pretty(
+                &serde_json::json!({"input_type":"midi","notes":notes.len(),"total_seconds":started.elapsed().as_secs_f64()}),
+            )?,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_outputs(
+    input: &std::path::Path,
+    outputs: &[&std::path::PathBuf],
+    timing: Option<&std::path::Path>,
+) -> Result<()> {
+    let normalized = |path: &std::path::Path| -> Result<String> {
+        let path = path.canonicalize().or_else(|_| std::path::absolute(path))?;
+        let text = path.to_string_lossy().into_owned();
+        Ok(if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        })
+    };
+    let input = normalized(input)?;
+    let mut seen = std::collections::BTreeSet::from([input]);
+    for path in outputs.iter().copied().map(|p| p.as_path()).chain(timing) {
+        ensure!(
+            seen.insert(normalized(path)?),
+            "Input and all output paths must differ; the source MIDI must not be overwritten"
+        );
     }
     Ok(())
 }

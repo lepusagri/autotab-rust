@@ -93,6 +93,8 @@ pub struct Options {
     pub source: Source,
     pub output: PathBuf,
     pub tuning: &'static str,
+    pub tab_engine: &'static str,
+    pub midi_track: crate::midi_input::Selection,
     pub device: &'static str,
     pub gpu_id: u16,
     pub threads: u16,
@@ -105,10 +107,22 @@ pub struct Options {
 }
 
 impl Options {
+    fn is_midi(&self) -> bool {
+        matches!(&self.source, Source::File(path) if crate::midi_input::is_midi(path))
+    }
     pub fn validate(&self) -> Result<()> {
-        self.hf_token.validate()?;
-        self.rhythm.validate()?;
-        if let Some(path) = &self.muscriptor_model {
+        if self.is_midi()
+            && let Source::File(path) = &self.source
+        {
+            crate::midi_input::MidiFile::read(path)?.select(self.midi_track)?;
+        }
+        if !self.is_midi() {
+            self.hf_token.validate()?;
+            self.rhythm.validate()?;
+        }
+        if !self.is_midi()
+            && let Some(path) = &self.muscriptor_model
+        {
             ensure!(
                 path.is_file(),
                 "Die lokale MuScriptor-Modelldatei wurde nicht gefunden."
@@ -117,7 +131,7 @@ impl Options {
         match &self.source {
             Source::File(path) => ensure!(
                 path.is_file(),
-                "Bitte eine vorhandene Audiodatei auswählen."
+                "Bitte eine vorhandene Audio- oder MIDI-Datei auswählen."
             ),
             Source::Url(url) => {
                 let url = reqwest::Url::parse(url)
@@ -135,7 +149,9 @@ impl Options {
             "Die Tab-Ausgabe muss eine .txt-Datei sein."
         );
         ensure!(
-            !self.output.exists() && !self.output.with_extension("mid").exists(),
+            ["txt", "mid", "gp5", "fingering.json"]
+                .iter()
+                .all(|extension| !self.output.with_extension(extension).exists()),
             "Ausgabedateien existieren bereits. Bitte einen anderen Zielordner wählen oder erneut starten."
         );
         ensure!(
@@ -160,27 +176,34 @@ impl Options {
         }
         for (flag, value) in [
             ("--tuning", self.tuning.to_owned()),
+            ("--tab-engine", self.tab_engine.to_owned()),
             ("--device", self.device.to_owned()),
             ("--gpu-id", self.gpu_id.to_string()),
             ("--threads", self.threads.to_string()),
-            ("--transcriber", self.transcriber.to_owned()),
         ] {
             args.push(flag.into());
             args.push(value.into());
         }
         args.push("--output".into());
         args.push(self.output.clone().into_os_string());
+        if self.is_midi() {
+            args.push("--midi-track".into());
+            args.push(self.midi_track.to_string().into());
+            return Ok(args);
+        }
+        args.push("--transcriber".into());
+        args.push(self.transcriber.into());
         if self.transcriber.starts_with("muscriptor-") {
             args.push("--instruments".into());
             args.push(self.instruments.to_string().into());
-            for (flag, value) in [
-                ("--bpm", self.rhythm.bpm.to_string()),
-                ("--time-signature", self.rhythm.meter.to_string()),
-                ("--quantize", self.rhythm.grid.as_cli().to_owned()),
-            ] {
-                args.push(flag.into());
-                args.push(value.into());
-            }
+        }
+        for (flag, value) in [
+            ("--bpm", self.rhythm.bpm.to_string()),
+            ("--time-signature", self.rhythm.meter.to_string()),
+            ("--quantize", self.rhythm.grid.as_cli().to_owned()),
+        ] {
+            args.push(flag.into());
+            args.push(value.into());
         }
         if let Some(path) = &self.muscriptor_model {
             args.push("--muscriptor-model".into());
@@ -210,7 +233,10 @@ pub fn output_path(folder: &Path, source: &Source) -> PathBuf {
             format!("{stem}_tab_{suffix}.txt")
         };
         let candidate = folder.join(name);
-        if !candidate.exists() && !candidate.with_extension("mid").exists() {
+        if ["txt", "mid", "gp5", "fingering.json"]
+            .iter()
+            .all(|extension| !candidate.with_extension(extension).exists())
+        {
             return candidate;
         }
     }
@@ -346,7 +372,9 @@ fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_console(&mut command);
-    options.hf_token.apply(&mut command);
+    if !options.is_midi() {
+        options.hf_token.apply(&mut command);
+    }
     let mut child = command
         .spawn()
         .context("Die Verarbeitung konnte nicht gestartet werden")?;
@@ -408,10 +436,87 @@ mod tests {
         let source = Source::File("a song.mp3".into());
         std::fs::write(directory.path().join("a song_tab.txt"), "existing").unwrap();
         std::fs::write(directory.path().join("a song_tab_1.mid"), "existing").unwrap();
+        std::fs::write(directory.path().join("a song_tab_2.gp5"), "existing").unwrap();
+        std::fs::write(
+            directory.path().join("a song_tab_3.fingering.json"),
+            "existing",
+        )
+        .unwrap();
         assert_eq!(
             output_path(directory.path(), &source),
-            directory.path().join("a song_tab_2.txt")
+            directory.path().join("a song_tab_4.txt")
         );
+    }
+    #[test]
+    fn midi_options_select_a_track_and_exclude_audio_settings() {
+        use basic_pitch::midi::midly::{
+            Format, Header, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("guitar.mid");
+        let midi = Smf {
+            header: Header::new(Format::SingleTrack, Timing::Metrical(480.into())),
+            tracks: vec![vec![
+                TrackEvent {
+                    delta: 0.into(),
+                    kind: TrackEventKind::Midi {
+                        channel: 0.into(),
+                        message: MidiMessage::NoteOn {
+                            key: 64.into(),
+                            vel: 100.into(),
+                        },
+                    },
+                },
+                TrackEvent {
+                    delta: 480.into(),
+                    kind: TrackEventKind::Midi {
+                        channel: 0.into(),
+                        message: MidiMessage::NoteOff {
+                            key: 64.into(),
+                            vel: 0.into(),
+                        },
+                    },
+                },
+            ]],
+        };
+        let mut bytes = Vec::new();
+        midi.write(&mut bytes).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let options = Options {
+            source: Source::File(path),
+            output: directory.path().join("result.txt"),
+            tuning: "standard",
+            tab_engine: "v3",
+            midi_track: crate::midi_input::Selection::Track(0),
+            device: "cpu",
+            gpu_id: 0,
+            threads: 4,
+            clean_guitar: true,
+            transcriber: "muscriptor-small",
+            muscriptor_model: Some("missing.safetensors".into()),
+            hf_token: HfToken::new("unused\ncredential"),
+            instruments: crate::instruments::Instruments::default(),
+            rhythm: crate::rhythm::Rhythm {
+                bpm: f64::NAN,
+                ..Default::default()
+            },
+        };
+        let arguments = options.arguments().unwrap();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|p| p == [OsString::from("--midi-track"), OsString::from("0")])
+        );
+        for flag in [
+            "--bpm",
+            "--quantize",
+            "--time-signature",
+            "--transcriber",
+            "--muscriptor-model",
+            "--skip-separation",
+        ] {
+            assert!(!arguments.contains(&OsString::from(flag)));
+        }
     }
 
     #[test]
@@ -427,6 +532,8 @@ mod tests {
             source: Source::File(input.clone()),
             output: directory.path().join("output.txt"),
             tuning: "drop_d",
+            tab_engine: "v3",
+            midi_track: crate::midi_input::Selection::Auto,
             device: "openvino",
             gpu_id: 1,
             threads: 4,
@@ -569,6 +676,8 @@ mod tests {
             source: Source::File(fixture(directory.path())),
             output: directory.path().join("result.txt"),
             tuning: "standard",
+            tab_engine: "v3",
+            midi_track: crate::midi_input::Selection::Auto,
             device: "openvino",
             gpu_id: 0,
             threads: 4,
@@ -606,6 +715,8 @@ mod tests {
             source: Source::File(fixture(directory.path())),
             output: output.clone(),
             tuning: "standard",
+            tab_engine: "v3",
+            midi_track: crate::midi_input::Selection::Auto,
             device: "cpu",
             gpu_id: 0,
             threads: 1,

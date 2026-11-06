@@ -32,6 +32,12 @@ pub struct AutoTab {
     url: String,
     folder: String,
     tuning: usize,
+    tab_engine: usize,
+    midi_track: crate::midi_input::Selection,
+    midi_tracks: Vec<crate::midi_input::TrackInfo>,
+    midi_summary: String,
+    midi_error: Option<String>,
+    inspected_midi: String,
     device: usize,
     gpu_id: u16,
     threads: u16,
@@ -54,6 +60,87 @@ pub struct AutoTab {
 }
 
 impl AutoTab {
+    fn is_midi(&self) -> bool {
+        !self.from_url && crate::midi_input::is_midi(std::path::Path::new(self.input.trim()))
+    }
+
+    fn refresh_midi(&mut self) {
+        if !self.is_midi() || self.inspected_midi == self.input {
+            return;
+        }
+        self.inspected_midi = self.input.clone();
+        self.midi_track = crate::midi_input::Selection::Auto;
+        self.midi_tracks.clear();
+        self.midi_error = None;
+        self.midi_summary.clear();
+        match crate::midi_input::MidiFile::read(std::path::Path::new(self.input.trim())) {
+            Ok(file) => {
+                self.midi_summary = format!(
+                    "{:.2} BPM · {} · {} Tempoabschnitte. Tempo und Taktart werden aus MIDI übernommen.",
+                    60_000_000.0 / f64::from(file.tempos[0].micros),
+                    file.meters[0].meter,
+                    file.tempos.len()
+                );
+                self.midi_tracks = file.tracks;
+            }
+            Err(error) => self.midi_error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn midi_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::midi_input::Selection;
+        let label = match self.midi_track {
+            Selection::Auto => "Automatisch: Gitarren, sonst melodische Spuren".to_owned(),
+            Selection::All => "Alle melodischen Spuren".to_owned(),
+            Selection::Track(index) => self
+                .midi_tracks
+                .iter()
+                .find(|t| t.index == index)
+                .map_or_else(
+                    || format!("Spur {index}"),
+                    |t| format!("Spur {}: {}", index, t.name),
+                ),
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label("MIDI-Spur");
+            egui::ComboBox::from_id_salt("midi_track")
+                .selected_text(label)
+                .width(350.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.midi_track,
+                        Selection::Auto,
+                        "Automatisch: Gitarren, sonst melodische Spuren",
+                    );
+                    ui.selectable_value(
+                        &mut self.midi_track,
+                        Selection::All,
+                        "Alle melodischen Spuren",
+                    );
+                    for track in &self.midi_tracks {
+                        if track.melodic_notes > 0 {
+                            ui.selectable_value(
+                                &mut self.midi_track,
+                                Selection::Track(track.index),
+                                format!(
+                                    "Spur {}: {} ({} Noten)",
+                                    track.index, track.name, track.melodic_notes
+                                ),
+                            );
+                        }
+                    }
+                });
+            if ui.small_button("Neu einlesen").clicked() {
+                self.inspected_midi.clear();
+                self.refresh_midi();
+            }
+        });
+        ui.label(RichText::new(&self.midi_summary).small().color(MUTED));
+        ui.label(RichText::new("Vorhandene Noten direkt verwenden: keine Audio-Erkennung. Schlagzeug bleibt ausgeschlossen; die MIDI-Vorschau enthält die gewählte Auswahl.").small().color(MUTED));
+        if let Some(error) = &self.midi_error {
+            ui.colored_label(Color32::DARK_RED, error);
+        }
+    }
     pub fn new(creation: &eframe::CreationContext<'_>) -> Self {
         let context = &creation.egui_ctx;
         context.set_visuals(egui::Visuals::light());
@@ -85,6 +172,12 @@ impl AutoTab {
             url: String::new(),
             folder: folder.to_string_lossy().into_owned(),
             tuning: 0,
+            tab_engine: 0,
+            midi_track: crate::midi_input::Selection::Auto,
+            midi_tracks: vec![],
+            midi_summary: String::new(),
+            midi_error: None,
+            inspected_midi: String::new(),
             device: 0,
             gpu_id: 0,
             threads: 4,
@@ -100,7 +193,7 @@ impl AutoTab {
             automatic_instruments: false,
             rhythm: crate::rhythm::Rhythm::default(),
             job: None,
-            status: "Bereit für deine Audiodatei".into(),
+            status: "Bereit für Audio oder MIDI".into(),
             error: None,
             progress: None,
             preview: String::new(),
@@ -145,7 +238,12 @@ impl AutoTab {
             return;
         }
         let source = self.source();
-        let instruments = match self.selected_instruments() {
+        let midi_mode = self.is_midi();
+        let instruments = match if midi_mode {
+            Ok(Instruments::default())
+        } else {
+            self.selected_instruments()
+        } {
             Ok(value) => value,
             Err(message) => {
                 self.error = Some(message);
@@ -156,23 +254,32 @@ impl AutoTab {
             output: job::output_path(&self.folder_path(), &source),
             source,
             tuning: TUNINGS[self.tuning].1,
+            tab_engine: if self.tab_engine == 0 { "v3" } else { "simple" },
+            midi_track: if midi_mode {
+                self.midi_track
+            } else {
+                crate::midi_input::Selection::Auto
+            },
             device: DEVICES[self.device].1,
             gpu_id: self.gpu_id,
             threads: self.threads,
             clean_guitar: self.clean_guitar,
             transcriber: TRANSCRIBERS[self.transcriber].1,
             instruments,
-            rhythm: if self.transcriber > 0 {
-                self.rhythm
-            } else {
+            rhythm: if midi_mode {
                 crate::rhythm::Rhythm::default()
+            } else {
+                self.rhythm
             },
-            hf_token: if self.transcriber > 0 {
+            hf_token: if self.transcriber > 0 && !midi_mode {
                 job::HfToken::new(&self.hf_token)
             } else {
                 job::HfToken::default()
             },
-            muscriptor_model: if self.transcriber > 0 && !self.muscriptor_model.trim().is_empty() {
+            muscriptor_model: if self.transcriber > 0
+                && !midi_mode
+                && !self.muscriptor_model.trim().is_empty()
+            {
                 Some(PathBuf::from(self.muscriptor_model.trim()))
             } else {
                 None
@@ -191,6 +298,7 @@ impl AutoTab {
     }
 
     fn receive_events(&mut self) {
+        let midi_mode = self.is_midi();
         let events: Vec<_> = self
             .job
             .as_ref()
@@ -200,10 +308,20 @@ impl AutoTab {
             match event {
                 Event::Line(line) => {
                     if line.starts_with("[1/4]") {
-                        self.status = "Audio wird heruntergeladen …".into();
+                        self.status = if midi_mode {
+                            "MIDI wird eingelesen …"
+                        } else {
+                            "Audio wird heruntergeladen …"
+                        }
+                        .into();
                     }
                     if line.starts_with("[2/4]") {
-                        self.status = "Audio und Gitarrentrennung werden vorbereitet …".into();
+                        self.status = if midi_mode {
+                            "MIDI-Spurauswahl wird vorbereitet …"
+                        } else {
+                            "Audio und Gitarrentrennung werden vorbereitet …"
+                        }
+                        .into();
                     }
                     if line.contains("Compiling Demucs") {
                         self.status =
@@ -219,10 +337,15 @@ impl AutoTab {
                     }
                     if line.starts_with("[3/4]") {
                         self.progress = None;
-                        self.status = "Noten werden erkannt …".into();
+                        self.status = if midi_mode {
+                            "Griffpositionen werden gesucht …"
+                        } else {
+                            "Noten werden erkannt …"
+                        }
+                        .into();
                     }
                     if line.starts_with("[4/4]") {
-                        self.status = "Tabulatur und MIDI werden gespeichert …".into();
+                        self.status = "Tabulatur, Guitar Pro und MIDI werden gespeichert …".into();
                     }
                     self.logs.push_back(line.chars().take(4_000).collect());
                     while self.logs.len() > 400 {
@@ -261,7 +384,7 @@ impl AutoTab {
     fn form(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).fill(Color32::WHITE).inner_margin(16.0).corner_radius(10.0).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.strong("1  Audio auswählen");
+                ui.strong("1  Audio oder MIDI auswählen");
                 ui.add_space(16.0);
                 ui.selectable_value(&mut self.from_url, false, "Datei");
                 ui.selectable_value(&mut self.from_url, true, "Link");
@@ -272,12 +395,14 @@ impl AutoTab {
                     .hint_text("https://… / direkter Audio-Link")).labelled_by(label.id);
                 ui.label(RichText::new("Direkte Audio-Links werden unterstützt. YouTube ist experimentell.").small().color(MUTED));
             } else {
-                let label = ui.label("Audiodatei");
+                let label = ui.label("Audio- oder MIDI-Datei");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.input).desired_width((ui.available_width() - 135.0).max(200.0))
-                        .hint_text("MP3, WAV, FLAC … oder Datei hierher ziehen")).labelled_by(label.id);
+                        .hint_text("MP3, WAV, MID, MIDI … oder Datei hierher ziehen")).labelled_by(label.id);
                     if ui.button("Datei wählen …").clicked()
-                        && let Some(file) = rfd::FileDialog::new().set_title("Audiodatei auswählen")
+                        && let Some(file) = rfd::FileDialog::new().set_title("Audio- oder MIDI-Datei auswählen")
+                            .add_filter("Audio und MIDI", &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "aiff", "wma", "mid", "midi"])
+                            .add_filter("MIDI", &["mid", "midi"])
                             .add_filter("Audio", &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "aiff", "wma"])
                             .add_filter("Alle Dateien", &["*"]).pick_file() {
                         self.input = file.to_string_lossy().into_owned();
@@ -285,18 +410,24 @@ impl AutoTab {
                     }
                 });
             }
+            self.refresh_midi();
+            let midi_mode = self.is_midi();
+            if midi_mode { self.midi_controls(ui); }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.label("Stimmung");
                 egui::ComboBox::from_id_salt("tuning").selected_text(TUNINGS[self.tuning].0).width(160.0).show_ui(ui, |ui| {
                     for (index, (label, _)) in TUNINGS.iter().enumerate() { ui.selectable_value(&mut self.tuning, index, *label); }
                 });
+                ui.add_enabled_ui(!midi_mode, |ui| {
                 ui.add_space(20.0);
                 ui.label("Verarbeitung");
                 egui::ComboBox::from_id_salt("device").selected_text(DEVICES[self.device].0).width(150.0).show_ui(ui, |ui| {
                     for (index, (label, _)) in DEVICES.iter().enumerate() { ui.selectable_value(&mut self.device, index, *label); }
-                });
+                    });
             });
+            });
+            if !midi_mode {
             if self.transcriber > 0 && self.selected_instruments().is_ok_and(|selection| selection.has_other_instruments()) {
                 ui.label(RichText::new("Originalaufnahme: Die gewählte Instrumentbesetzung wird ohne Demucs-Gitarrentrennung erkannt.").small().color(MUTED));
             } else {
@@ -310,7 +441,18 @@ impl AutoTab {
                     }
                 });
             });
-            if self.transcriber > 0 {
+            }
+            ui.horizontal(|ui| {
+                ui.label("Griffpositionen");
+                egui::ComboBox::from_id_salt("tab_engine")
+                    .selected_text(if self.tab_engine == 0 { "KI-Modell v3" } else { "Regelbasierte Griffsuche" })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.tab_engine, 0, "KI-Modell v3");
+                        ui.selectable_value(&mut self.tab_engine, 1, "Regelbasierte Griffsuche");
+                    });
+            });
+            if self.transcriber == 0 && !midi_mode { self.rhythm_controls(ui); }
+            if self.transcriber > 0 && !midi_mode {
                 ui.horizontal(|ui| {
                     ui.label("Erwartete Instrumente");
                     ui.checkbox(&mut self.automatic_instruments, "Automatisch erkennen");
@@ -334,25 +476,7 @@ impl AutoTab {
                     });
                 });
                 ui.label(RichText::new("MIDI: alle erkannten Instrumente als getrennte Spuren. Tabulatur: Gitarrennoten.").small().color(MUTED));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Tempo (BPM)").on_hover_text("Viertelnoten pro Minute; keine Änderung der Audio-Geschwindigkeit.");
-                    ui.add(egui::DragValue::new(&mut self.rhythm.bpm).range(4.0..=1000.0).speed(0.5).max_decimals(2));
-                    ui.label("Taktart");
-                    ui.add(egui::DragValue::new(&mut self.rhythm.meter.numerator).range(1..=32));
-                    ui.label("/");
-                    egui::ComboBox::from_id_salt("meter_denominator").selected_text(self.rhythm.meter.denominator.to_string()).width(50.0).show_ui(ui, |ui| {
-                        for denominator in [1, 2, 4, 8, 16, 32, 64] {
-                            ui.selectable_value(&mut self.rhythm.meter.denominator, denominator, denominator.to_string());
-                        }
-                    });
-                    ui.label("Notenraster");
-                    let choices = [(crate::rhythm::Grid::Off, "Aus – Originaltiming"), (crate::rhythm::Grid::Eighth, "Achtel (1/8)"), (crate::rhythm::Grid::Sixteenth, "Sechzehntel (1/16)")];
-                    let label = choices.iter().find(|(grid, _)| *grid == self.rhythm.grid).unwrap().1;
-                    egui::ComboBox::from_id_salt("note_grid").selected_text(label).width(165.0).show_ui(ui, |ui| {
-                        for (grid, label) in choices { ui.selectable_value(&mut self.rhythm.grid, grid, label); }
-                    });
-                });
-                ui.label(RichText::new("BPM = Viertelnoten/min. MIDI-Raster ab Dateianfang; ASCII-Tabs haben keine Rhythmusnotation.").small().color(MUTED));
+                self.rhythm_controls(ui);
                 let token_label = ui.label("Hugging-Face-Token (optional)");
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.hf_token)
@@ -385,9 +509,9 @@ impl AutoTab {
                     self.folder = folder.to_string_lossy().into_owned();
                 }
             });
-            ui.label(RichText::new("Tabulatur (.txt) und MIDI (.mid). Vorhandene Ergebnisse bleiben erhalten.").small().color(MUTED));
+            ui.label(RichText::new("Tabulatur (.txt), Guitar Pro (.gp5), MIDI (.mid) und Griffdaten (.fingering.json).").small().color(MUTED));
             egui::CollapsingHeader::new("Weitere Einstellungen").show(ui, |ui| {
-                if self.transcriber > 0 {
+                if self.transcriber > 0 && !midi_mode {
                     ui.label("Lokale MuScriptor-Modelldatei (optional)");
                     ui.horizontal(|ui| {
                         ui.add(egui::TextEdit::singleline(&mut self.muscriptor_model).desired_width((ui.available_width() - 135.0).max(200.0)).hint_text("Automatisch aus Cache / Download"));
@@ -398,11 +522,11 @@ impl AutoTab {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Intel-GPU-Index"); ui.add(egui::DragValue::new(&mut self.gpu_id).range(0..=15));
+                    if !midi_mode { ui.label("Intel-GPU-Index"); ui.add(egui::DragValue::new(&mut self.gpu_id).range(0..=15)); }
                     ui.add_space(20.0);
                     ui.label("CPU-Threads"); ui.add(egui::DragValue::new(&mut self.threads).range(1..=64));
                 });
-                ui.small("GPU.0 ist normalerweise die integrierte Intel-GPU. Für eine zweite Intel-GPU: Index 1.");
+                if !midi_mode { ui.small("GPU.0 ist normalerweise die integrierte Intel-GPU. Für eine zweite Intel-GPU: Index 1."); }
             });
         });
     }
@@ -416,6 +540,55 @@ impl AutoTab {
         }
         Instruments::from_ids(GROUPS.iter().zip(&self.instrument_groups).filter(|(_, selected)| **selected).map(|(group, _)| group.id))
             .map_err(|_| "Bitte mindestens ein erwartetes Instrument auswählen oder die automatische Erkennung aktivieren.".to_owned())
+    }
+
+    fn rhythm_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Tempo (BPM)").on_hover_text(
+                "Viertelnoten pro Minute; keine Änderung der Audio-Geschwindigkeit.",
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.rhythm.bpm)
+                    .range(4.0..=1000.0)
+                    .speed(0.5)
+                    .max_decimals(2),
+            );
+            ui.label("Taktart");
+            ui.add(egui::DragValue::new(&mut self.rhythm.meter.numerator).range(1..=32));
+            ui.label("/");
+            egui::ComboBox::from_id_salt("meter_denominator")
+                .selected_text(self.rhythm.meter.denominator.to_string())
+                .width(50.0)
+                .show_ui(ui, |ui| {
+                    for denominator in [1, 2, 4, 8, 16, 32, 64] {
+                        ui.selectable_value(
+                            &mut self.rhythm.meter.denominator,
+                            denominator,
+                            denominator.to_string(),
+                        );
+                    }
+                });
+            ui.label("Notenraster");
+            let choices = [
+                (crate::rhythm::Grid::Off, "Aus – Originaltiming"),
+                (crate::rhythm::Grid::Eighth, "Achtel (1/8)"),
+                (crate::rhythm::Grid::Sixteenth, "Sechzehntel (1/16)"),
+            ];
+            let label = choices
+                .iter()
+                .find(|(grid, _)| *grid == self.rhythm.grid)
+                .unwrap()
+                .1;
+            egui::ComboBox::from_id_salt("note_grid")
+                .selected_text(label)
+                .width(165.0)
+                .show_ui(ui, |ui| {
+                    for (grid, label) in choices {
+                        ui.selectable_value(&mut self.rhythm.grid, grid, label);
+                    }
+                });
+        });
+        ui.label(RichText::new("BPM = Viertelnoten/min. GP5 zeigt Rhythmusnotation auf einem 1/32-Raster; MIDI behält bei Raster Aus das Originaltiming.").small().color(MUTED));
     }
 
     fn select_groups(&mut self, ids: &[u8]) {
@@ -461,11 +634,26 @@ impl AutoTab {
                 }
             });
         });
+        if let Some((tab, _)) = &self.result {
+            let gp5 = tab.with_extension("gp5");
+            if gp5.is_file() && ui.button("Guitar Pro öffnen").clicked() {
+                let mut command = Command::new("explorer.exe");
+                job::hide_console(&mut command);
+                if let Err(error) = command.arg(gp5).spawn() {
+                    self.error = Some(error.to_string());
+                }
+            }
+        }
         if let Some((tab, midi)) = &self.result {
             ui.label(
-                RichText::new(format!("{}\n{}", tab.display(), midi.display()))
-                    .small()
-                    .color(MUTED),
+                RichText::new(format!(
+                    "{}\n{}\n{}",
+                    tab.display(),
+                    midi.display(),
+                    tab.with_extension("gp5").display()
+                ))
+                .small()
+                .color(MUTED),
             );
         }
         self.playback_controls(ui);
@@ -639,7 +827,8 @@ impl eframe::App for AutoTab {
                                         .color(Color32::from_rgb(23, 39, 62)),
                                 );
                                 ui.label(
-                                    RichText::new("Audio in Gitarrentabs verwandeln").color(MUTED),
+                                    RichText::new("Audio und MIDI in Gitarrentabs verwandeln")
+                                        .color(MUTED),
                                 );
                             });
                         });

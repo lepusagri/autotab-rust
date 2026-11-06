@@ -7,6 +7,9 @@ mod app;
 mod instruments;
 #[path = "../gui/job.rs"]
 mod job;
+#[path = "../midi_input.rs"]
+#[allow(dead_code)] // Import/export helpers are shared with the CLI backend.
+mod midi_input;
 #[path = "../gui/playback.rs"]
 mod playback;
 #[path = "../rhythm.rs"]

@@ -18,8 +18,13 @@ foreach ($mode in @('separated', 'clean')) {
     if ($midi.Length -lt 14 -or [Text.Encoding]::ASCII.GetString($midi, 0, 4) -ne 'MThd') {
         throw "Invalid MIDI: $mode"
     }
-    if ($mode -eq 'clean' -and (Get-Content $tab -Raw) -notmatch '(?m)^E\|.*\d') {
-        throw 'Expected low guitar note missing in clean A2 transcription'
+    $gp5 = [IO.File]::ReadAllBytes([IO.Path]::ChangeExtension($tab, 'gp5'))
+    if ($gp5.Length -lt 100 -or [Text.Encoding]::ASCII.GetString($gp5, 0, 30) -notmatch 'FICHIER GUITAR PRO') {
+        throw "Invalid Guitar Pro file: $mode"
+    }
+    $report = Get-Content ([IO.Path]::ChangeExtension($tab, 'fingering.json')) -Raw | ConvertFrom-Json
+    if ($mode -eq 'clean' -and -not ($report.arrangement.notes | Where-Object { $_.pitch -eq 45 })) {
+        throw 'Expected A2 missing in clean guitar arrangement'
     }
 }
-Write-Host 'Native MP3 -> guitar -> MIDI/tab and clean-guitar tests passed.'
+Write-Host 'Native MP3 -> guitar -> MIDI/tab/GP5 and clean-guitar tests passed.'
